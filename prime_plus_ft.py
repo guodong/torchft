@@ -192,14 +192,14 @@ def main() -> None:
     #         diloco_offloaded_param_list=diloco.param_list_cpu if config.diloco is not None else None,  )
 
     #torchtitan version
-    ckpt_manager = CkptManager(
-        dataloader=trainloader,
-        model_parts=m,
-        optimizers=optimizers,
-        lr_schedulers=scheduler,
-        states={"train_state": train_state},
-        job_config=job_config,
-    )
+    # ckpt_manager = CkptManager(
+    #     dataloader=trainloader,
+    #     model_parts=m,
+    #     optimizers=optimizers,
+    #     lr_schedulers=scheduler,
+    #     states={"train_state": train_state},
+    #     job_config=job_config,
+    # )
 
     m.train()
     manager.start_quorum() #this line must be added, otherwise, "pseudogradient = p.data - self.original_parameters[name]" could cause semantic error

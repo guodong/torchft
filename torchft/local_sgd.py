@@ -20,6 +20,7 @@ from torch.utils.hooks import RemovableHandle
 
 from torchft.manager import Manager
 
+import torch.distributed.checkpoint as dcp
 
 from torch.distributed.tensor import DeviceMesh, distribute_tensor
 
@@ -269,6 +270,16 @@ class DiLoCo:
         #         # param.data = param_offloaded_on_device
         self._perform_sync()
         self._local_step = 0
+
+
+        self._async_wait()
+        self.async_future = dcp.async_save(
+                self.states, checkpoint_id=checkpoint_id, process_group=self._manager._pg
+            )
+
+    def _async_wait(self):
+        self.async_future.result()
+
 
     def _perform_sync(self) -> None:
         """
