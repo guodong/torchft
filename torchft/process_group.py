@@ -67,6 +67,8 @@ from torch.distributed.distributed_c10d import (
 from torch.futures import Future
 from torch.utils._pytree import tree_any
 
+from torchft.error_bus import ManagedErrorBus, Message as ErrorBusMessage
+from torchft.error_bus_abort_handler import error_bus_abort_handler
 from torchft.futures import context_timeout, stream_timeout
 from torchft.multiprocessing import _MonitoredPipe
 
@@ -335,6 +337,12 @@ class ProcessGroup(BaseProcessGroup):
     def abort(self) -> None:
         """
         Aborts the process group.
+        """
+        pass
+
+    def error_bus_abort(self, error_msg: ErrorBusMessage) -> None:
+        """
+        Reponds to error message from an error bus
         """
         pass
 
@@ -1101,7 +1109,6 @@ def _assert_list(tensors: Union[List[torch.Tensor], List[List[torch.Tensor]]]) -
     if not isinstance(tensors, list):
         raise TypeError(f"expected list but got {type(tensors)}")
 
-
 class ProcessGroupBaby(ProcessGroup):
     """
     This is a process group that runs the underlying process group in a
@@ -1346,6 +1353,9 @@ class ProcessGroupBaby(ProcessGroup):
                     )
                 elif cmd == "num_active_work":
                     req_pipe.send(len(work))
+                elif cmd == "error_bus_abort":
+                    error_msg = cast(ErrorBusMessage, op[1])
+                    error_bus_abort_handler(pg, error_msg)
                 else:
                     raise ValueError(f"unknown cmd: {cmd}")
 
@@ -1576,7 +1586,11 @@ class ProcessGroupBaby(ProcessGroup):
 
         assert self._pipe is not None
         return cast(int, self._pipe.recv(self._timeout))
-
+    
+    def error_bus_abort(self, error_msg: ErrorBusMessage) -> None:
+        assert self._pipe is not None
+        self._pipe.send(("error_bus_abort", error_msg))
+        self._errored = error_msg
 
 @dataclass
 class _PickleSafeOptions:

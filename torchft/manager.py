@@ -42,7 +42,7 @@ from torch.distributed import ReduceOp, TCPStore
 from torchft._torchft import ManagerClient, ManagerServer
 from torchft.checkpointing import CheckpointTransport, HTTPTransport
 from torchft.futures import future_timeout
-from torchft.error_bus import ErrorBus, Message # NEW
+from torchft.error_bus import ManagedErrorBus, Message as ErrorBusMessage 
 
 if TYPE_CHECKING:
     from torchft.process_group import ProcessGroup
@@ -107,10 +107,10 @@ class Manager:
         hostname: str = socket.gethostname(),
         heartbeat_interval: timedelta = timedelta(milliseconds=100),
         checkpoint_transport: Optional[CheckpointTransport[Dict[str, T]]] = None,
-        enable_error_bus: bool = False, # NEW
-        error_bus_queue_size: int = 100, # NEW
-        error_bus_debug: bool = False, # NEW
-        error_bus_daemon: bool = True # NEW
+        enable_error_bus: bool = False, 
+        error_bus_queue_size: int = 100, 
+        error_bus_debug: bool = False, 
+        error_bus_daemon: bool = True 
     ) -> None:
         """
         Args:
@@ -158,14 +158,15 @@ class Manager:
         self._connect_timeout = connect_timeout
         self._world_size_mode = world_size_mode
         self._replica_id = replica_id
-        self._enable_error_bus = enable_error_bus # NEW
-        self._error_bus_queue_size = error_bus_queue_size # NEW
-        self._error_bus_debug = error_bus_debug # NEW
-        self._error_bus_daemon = error_bus_daemon # NEW
+        self._enable_error_bus = enable_error_bus 
+        self._error_bus_queue_size = error_bus_queue_size 
+        self._error_bus_debug = error_bus_debug 
+        self._error_bus_daemon = error_bus_daemon 
 
         if self._enable_error_bus:
-            self._error_bus = ErrorBus(
-                name=f"ManagerErrorBus-{self._replica_id}",
+            self._error_bus = ManagedErrorBus(
+                manager=self,
+                name=f"ManagedErrorBus-{self._replica_id}",
                 debug=self._error_bus_debug,
                 daemon=self._error_bus_daemon,
                 queue_size=self._error_bus_queue_size,
@@ -270,6 +271,9 @@ class Manager:
             self._manager.shutdown()
         self._executor.shutdown(wait=wait)
 
+    def _abort_local(self, error_msg: ErrorBusMessage) -> None:
+        self._pg.error_bus_abort(error_msg)
+
     def allreduce(self, tensor: torch.Tensor) -> torch.futures.Future[torch.Tensor]:
         """
         Fault tolerant allreduce the tensor and return a Future that will be completed when
@@ -350,7 +354,7 @@ class Manager:
 
         if self._error_bus:
             try:
-                error_msg = Message(
+                error_msg = ErrorBusMessage(
                     type=type(e).__name__,
                     replica_id=self._replica_id
                 )
