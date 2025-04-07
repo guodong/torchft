@@ -25,10 +25,13 @@ and Hybrid FSDP.
 
 """
 
+from ast import Store
 import concurrent.futures
 import logging
 import os
 import socket
+import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -42,7 +45,7 @@ from torch.distributed import ReduceOp, TCPStore
 from torchft._torchft import ManagerClient, ManagerServer
 from torchft.checkpointing import CheckpointTransport, HTTPTransport
 from torchft.futures import future_timeout
-from torchft.error_bus import ManagedErrorBus, Message as ErrorBusMessage 
+from torchft.error_bus import ManagedErrorBus, Message as ErrorBusMessage, ErrorChannel
 
 if TYPE_CHECKING:
     from torchft.process_group import ProcessGroup
@@ -158,11 +161,13 @@ class Manager:
         self._connect_timeout = connect_timeout
         self._world_size_mode = world_size_mode
         self._replica_id = replica_id
+
         self._enable_error_bus = enable_error_bus 
         self._error_bus_queue_size = error_bus_queue_size 
         self._error_bus_debug = error_bus_debug 
         self._error_bus_daemon = error_bus_daemon 
-
+        self._error_bus_channel: Optional[ErrorChannel] = None
+        self._error_bus_listening_thread: Optional[threading.Thread] = None
         if self._enable_error_bus:
             self._error_bus = ManagedErrorBus(
                 manager=self,
@@ -203,6 +208,13 @@ class Manager:
         )
         self._pg = pg
         self._manager: Optional[ManagerServer] = None
+
+        if self._enable_error_bus:
+            self._error_bus_listening_thread = threading.Thread(
+                target=self._listen_for_error_bus,
+                daemon=True,
+            )
+            self._error_bus_listening_thread.start()
 
         self._recovery_stream: Optional["torch.cuda.Stream"] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
@@ -271,8 +283,59 @@ class Manager:
             self._manager.shutdown()
         self._executor.shutdown(wait=wait)
 
+    def _listen_for_error_bus(self) -> None:
+        """
+        Listen for error bus messages and abort local if the message is for this replica.
+
+        Listenes to the error bus through the shared store. Error bus creates a PrefixStore.
+        """
+        self._error_bus_channel = self._error_bus.get_channel(self._store)
+        
+        if self._error_bus_channel is None:
+            self._logger.warning("Error bus channel is not available")
+            return
+            
+        self._logger.info("Starting error bus listening thread")
+        
+        while True:
+            try:
+                # Blocking receive of message from the channel
+                message = self._error_bus_channel.recv_message()
+                self._logger.info(f"Received message from error bus: message={message}")
+                
+                if message is None:
+                    continue
+                    
+                # Format the message into the correct form if needed
+                if not isinstance(message, ErrorBusMessage):
+                    self._logger.error(f"Received non-ErrorBusMessage on error bus: message={message}")
+                    message = ErrorBusMessage(
+                        sender_type=None,
+                        error_replica_id=None,
+                        type="unknown"
+                    )
+                
+                # Add to the error bus message queue
+                if self._error_bus:
+                    message.sender_type = "listening_thread"
+                    self._error_bus.message_queue.put(message)
+                    self._logger.info(f"Added message to error bus queue: message={message}")
+            except Exception as e:
+                # Log but continue the loop to maintain the listener
+                self._logger.exception(f"Error in error bus listener: error={e}")
+                
+                # Brief sleep to prevent tight loop in case of persistent errors
+                time.sleep(0.1)
+
     def _abort_local(self, error_msg: ErrorBusMessage) -> None:
         self._pg.error_bus_abort(error_msg)
+    
+    def _broadcast(self, error_msg: ErrorBusMessage) -> None:
+        if self._error_bus_channel is None:
+            self._logger.warning("Error bus channel is not set")
+        else:
+            self._error_bus_channel.broadcast_message(error_msg)
+    
 
     def allreduce(self, tensor: torch.Tensor) -> torch.futures.Future[torch.Tensor]:
         """
@@ -355,8 +418,9 @@ class Manager:
         if self._error_bus:
             try:
                 error_msg = ErrorBusMessage(
-                    type=type(e).__name__,
-                    replica_id=self._replica_id
+                    sender_type=f"manager_{self._replica_id}",
+                    error_replica_id=self._replica_id,
+                    type=type(e).__name__
                 )
                 self._error_bus.notify(error_msg)
                 self._logger.info(f"Notified local ErrorBus about {error_msg}")
