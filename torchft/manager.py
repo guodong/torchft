@@ -42,6 +42,7 @@ from torch.distributed import ReduceOp, TCPStore
 from torchft._torchft import ManagerClient, ManagerServer
 from torchft.checkpointing import CheckpointTransport, HTTPTransport
 from torchft.futures import future_timeout
+from torchft.error_bus import ErrorBus, Message # NEW
 
 if TYPE_CHECKING:
     from torchft.process_group import ProcessGroup
@@ -106,6 +107,10 @@ class Manager:
         hostname: str = socket.gethostname(),
         heartbeat_interval: timedelta = timedelta(milliseconds=100),
         checkpoint_transport: Optional[CheckpointTransport[Dict[str, T]]] = None,
+        enable_error_bus: bool = False, # NEW
+        error_bus_queue_size: int = 100, # NEW
+        error_bus_debug: bool = False, # NEW
+        error_bus_daemon: bool = True # NEW
     ) -> None:
         """
         Args:
@@ -152,6 +157,21 @@ class Manager:
         self._quorum_timeout = quorum_timeout
         self._connect_timeout = connect_timeout
         self._world_size_mode = world_size_mode
+        self._replica_id = replica_id
+        self._enable_error_bus = enable_error_bus # NEW
+        self._error_bus_queue_size = error_bus_queue_size # NEW
+        self._error_bus_debug = error_bus_debug # NEW
+        self._error_bus_daemon = error_bus_daemon # NEW
+
+        if self._enable_error_bus:
+            self._error_bus = ErrorBus(
+                name=f"ManagerErrorBus-{self._replica_id}",
+                debug=self._error_bus_debug,
+                daemon=self._error_bus_daemon,
+                queue_size=self._error_bus_queue_size,
+            )
+        else:
+            self._error_bus = None
 
         store_addr = store_addr or os.environ["MASTER_ADDR"]
         store_port = store_port or int(os.environ["MASTER_PORT"])
@@ -214,6 +234,7 @@ class Manager:
 
             self._store.set(MANAGER_ADDR_KEY, self._manager.address())
             self._store.set(REPLICA_ID_KEY, replica_id)
+
 
         addr = self._store.get(MANAGER_ADDR_KEY).decode("utf-8")
         self._client = ManagerClient(addr, connect_timeout=connect_timeout)
@@ -321,8 +342,23 @@ class Manager:
 
         This should be called when an error occurs that leads to a corrupted
         gradient that needs to be discarded.
+
+        If an error bus exists, the error will be broadcasted to all
+        replicas.
         """
         self._errored = e
+
+        if self._error_bus:
+            try:
+                error_msg = Message(
+                    type=type(e).__name__,
+                    replica_id=self._replica_id
+                )
+                self._error_bus.notify(error_msg)
+                self._logger.info(f"Notified local ErrorBus about {error_msg}")
+            except Exception as e:
+                self._logger.exception(f"Failed to notify ErrorBus {self._error_bus.name} about {error_msg}: {e}")
+        
 
     def errored(self) -> Optional[Exception]:
         """
