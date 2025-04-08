@@ -161,7 +161,7 @@ def main() -> None:
     # manager.start_quorum() #this line must be added！！！！otherwise, "pseudogradient = p.data - self.original_parameters[name]" could cause semantic error
     loss_batch = 0
     with DiLoCo(
-            manager, m, inner_optimizer, outer_optimizer, sync_every=local_steps,backup_device=torch.device("cpu"),off_load=True
+            manager, m, inner_optimizer, outer_optimizer, sync_every=local_steps,backup_device=device
         ) as diloco:
 
         for step, batch in enumerate(iterable=trainloader):

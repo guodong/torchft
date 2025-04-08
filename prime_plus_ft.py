@@ -38,25 +38,14 @@ from torchft import (
 from torchft.local_sgd import DiLoCo
 from torchft.process_group import ManagedProcessGroup, ft_init_device_mesh
 
-from torchft.checkpointmanager import CkptManager
+# from torchft.checkpointmanager import CkptManager
 
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy, CPUOffloadPolicy
 
 logging.basicConfig(level=logging.INFO)
 
-# def get_offloaded_param(outer_optimizer: torch.optim.Optimizer):
-#     return [
-#         param.data.detach().clone().to("cpu")
-#         for group in outer_optimizer.param_groups
-#         for param in group["params"]
-#     ]
 
-
-# app = App()
-
-
-# @app.default
 def main() -> None:
     batch_size: int = 512
     per_device_train_batch_size: int = 32
@@ -78,19 +67,11 @@ def main() -> None:
     world_size = 2
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # if local_rank == 0:
-    #     wandb.init(project=project)
 
     # Load model configuration and tokenizer
     config = LlamaConfig.from_pretrained(pretrained_model_name_or_path=config_path)
 
     m = LlamaForCausalLM(config).to(device)
-
-    # for param in model.parameters():
-    #     # this make sure all device have the same weight init
-    #     dist.broadcast(param.data, src=0)
-
-    # Setup optimizers
     
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -119,8 +100,6 @@ def main() -> None:
     trainloader = StatefulDataLoader(
         tokenized_datasets["train"], batch_size=per_device_train_batch_size, num_workers=2, sampler=sampler, collate_fn=data_collator
     )
-
-    
 
 
     def load_state_dict(state_dict):
@@ -153,17 +132,17 @@ def main() -> None:
     )
 
     
-    device_mesh = ft_init_device_mesh(
-            device_type="cuda",
-            mesh_shape=(NUM_REPLICA_GROUPS, num_replicas),
-            mesh_dim_names=("dp_replicate", "dp_shard"),
-            replicate_dim=local_rank,
-            manager=manager,
-        )   #如果有新的节点加入，或有节点退出，这个会被重新建构吗？
+    # device_mesh = ft_init_device_mesh(
+    #         device_type="cuda",
+    #         mesh_shape=(NUM_REPLICA_GROUPS, num_replicas),
+    #         mesh_dim_names=("dp_replicate", "dp_shard"),
+    #         replicate_dim=local_rank,
+    #         manager=manager,
+    #     )   #if there's new node coming in or out, will this mesh be recreated?
     
 
-    m = fully_shard(m, mesh=device_mesh, offload_policy=CPUOffloadPolicy(pin_memory=True))
-    #need to deal with the problem of dtensor and torch.tensor in local_sgd.py
+    # m = fully_shard(m, mesh=device_mesh, offload_policy=CPUOffloadPolicy(pin_memory=True))
+    #TODO:need to deal with the problem of dtensor and torch.tensor in local_sgd.py
 
     inner_optimizer = torch.optim.AdamW(
         m.parameters(), weight_decay=0.1, lr=lr, betas=(0.9, 0.95)
@@ -171,8 +150,6 @@ def main() -> None:
     outer_optimizer = torch.optim.SGD(
         m.parameters(), lr=outer_lr, momentum=0.9, nesterov=True
     )
-
-    # params_offloaded = get_offloaded_param(outer_optimizer)
 
     scheduler = get_cosine_schedule_with_warmup(
         inner_optimizer,
@@ -202,11 +179,12 @@ def main() -> None:
     # )
 
     m.train()
-    manager.start_quorum() #this line must be added, otherwise, "pseudogradient = p.data - self.original_parameters[name]" could cause semantic error
+    # manager.start_quorum() 
+    # TODO: find out whether this line should be added, otherwise, "pseudogradient = p.data - self.original_parameters[name]" could cause semantic error
     loss_batch = 0
     with DiLoCo(
-            manager, m, inner_optimizer, outer_optimizer, sync_every=local_steps,backup_device=torch.device("cpu"),off_load=True
-        ) as diloco:
+            manager, m, inner_optimizer, outer_optimizer, sync_every=30,backup_device=torch.device("cpu"),off_load=True,
+            rpg_id=REPLICA_GROUP_ID,local_rank=local_rank) as diloco:
 
         for step, batch in enumerate(iterable=trainloader):
             if step == 0:
@@ -219,7 +197,6 @@ def main() -> None:
             out = m(**batch)
             loss = out.loss / gradient_accumulation_steps
             loss_batch += loss.detach()
-            # loss = criterion(out, labels)
             loss.backward()
             if step_within_grad_acc == 0:
                 
@@ -236,7 +213,7 @@ def main() -> None:
                     )
                     loss_batch = 0
     print("Training completed.")
-    # wandb.finish()            
+       
                 
 
 if __name__ == "__main__":

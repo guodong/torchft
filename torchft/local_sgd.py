@@ -167,7 +167,9 @@ class DiLoCo:
         backup_device: Optional[torch.device] = None,
         pin_memory: bool = True,
         off_load: bool = False,
-        if_shard: bool = False
+        if_shard: bool = False,
+        rpg_id: int = 0,
+        local_rank: int = 0,
     ) -> None:
         if manager._use_async_quorum:
             raise ValueError(
@@ -186,6 +188,7 @@ class DiLoCo:
 
         self._off_load = off_load
         self._if_shard = if_shard
+        self.async_future = None
 
         self._hooks: List[RemovableHandle] = []
         self._outer_optimizer = outer_optimizer
@@ -205,6 +208,9 @@ class DiLoCo:
         # if off_load:
         #     self.params_offloaded = self.get_offloaded_param(self._outer_optimizer)
 
+        self.states=self._manager.state_dict()
+        self.checkpoint_id="/srv/apps/danny/ckpt/"+f"replica_group_{rpg_id}/"+f"local_rank_{local_rank}"
+
     def get_offloaded_param(outer_optimizer: torch.optim.Optimizer):
         return [
             param.data.detach().clone().to("cpu")
@@ -215,7 +221,9 @@ class DiLoCo:
     def _save_parameters(self) -> None:
         with torch.no_grad():
             # TODO: consider running copy on a separate stream
+            # TODO: to_local could cause error
             for name, p in self._model.named_parameters():
+                # self.original_parameters[name].copy_(p.data.to_local(), non_blocking=True)
                 self.original_parameters[name].copy_(p.data, non_blocking=True)
 
     def _restore_parameters(self) -> None:
@@ -261,24 +269,17 @@ class DiLoCo:
         """
         self._manager.start_quorum()
 
-
-        # if self._off_load:
-        #     for param_offloaded in self.params_offloaded:
-        #         param_offloaded_on_device = param_offloaded.data.to("cuda")
-        #         # param.grad = param_offloaded_on_device - param.data
-        #         # dist.all_reduce(tensor=param.grad, op=dist.ReduceOp.AVG)
-        #         # param.data = param_offloaded_on_device
         self._perform_sync()
         self._local_step = 0
 
-
         self._async_wait()
         self.async_future = dcp.async_save(
-                self.states, checkpoint_id=checkpoint_id, process_group=self._manager._pg
+                self.states, checkpoint_id=self.checkpoint_id, process_group=self._manager._pg
             )
 
     def _async_wait(self):
-        self.async_future.result()
+        if self.async_future != None:
+            self.async_future.result()
 
 
     def _perform_sync(self) -> None:
