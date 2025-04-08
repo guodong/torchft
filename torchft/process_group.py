@@ -40,14 +40,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-# pyre-fixme[21]: no attribute ProcessGroupNCCL
 # pyre-fixme[21]: no attribute ProcessGroupGloo
 from torch.distributed import (
     DeviceMesh,
     PrefixStore,
     ProcessGroup as BaseProcessGroup,
     ProcessGroupGloo as BaseProcessGroupGloo,
-    ProcessGroupNCCL as BaseProcessGroupNCCL,
     Store,
     TCPStore,
 )
@@ -695,6 +693,9 @@ class ProcessGroupNCCL(ProcessGroupWrapper):
         return _WorkCUDATimeout(self, work, timeout)
 
     def _create_pg(self, store: Store, rank: int, world_size: int) -> BaseProcessGroup:
+        # pyre-fixme[21]: no attribute ProcessGroupNCCL
+        from torch.distributed import ProcessGroupNCCL as BaseProcessGroupNCCL
+
         self._errored = None
 
         pg = BaseProcessGroup(store, rank, world_size)
@@ -1731,6 +1732,8 @@ class ProcessGroupBabyNCCL(ProcessGroupBaby):
 
     @classmethod
     def _create_pg(cls, store: Store, rank: int, world_size: int) -> BaseProcessGroup:
+        from torch.distributed import ProcessGroupNCCL as BaseProcessGroupNCCL
+
         pg = BaseProcessGroup(store, rank, world_size)
         pg._set_default_backend(ProcessGroup.BackendType.NCCL)
         # pyre-fixme[16]: no attribute ProcessGroupNCCL
