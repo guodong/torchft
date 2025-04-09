@@ -110,10 +110,14 @@ class Manager:
         hostname: str = socket.gethostname(),
         heartbeat_interval: timedelta = timedelta(milliseconds=100),
         checkpoint_transport: Optional[CheckpointTransport[Dict[str, T]]] = None,
+<<<<<<< HEAD
         enable_error_bus: bool = False, 
         error_bus_queue_size: int = 100, 
         error_bus_debug: bool = False, 
         error_bus_daemon: bool = True 
+=======
+        init_sync: bool = True,
+>>>>>>> dc1037e... manager: Add option to skip initial sync (#159)
     ) -> None:
         """
         Args:
@@ -151,6 +155,9 @@ class Manager:
             hostname: if rank==0, the hostname to advertise to the lighthouse server
             checkpoint_transport: the checkpoint transport to use for
                 transfering checkpoints to recovering replicas, defaults to HTTPTransport
+            init_sync: whether to synchronize the model weights on step 0. If
+                all of the model weights are initialized identically via
+                ``torch.set_seed`` you should set this to False.
         """
         self._load_state_dict = load_state_dict
         self._user_state_dict = state_dict
@@ -178,6 +185,7 @@ class Manager:
             )
         else:
             self._error_bus = None
+        self._init_sync = init_sync
 
         store_addr = store_addr or os.environ["MASTER_ADDR"]
         store_port = store_port or int(os.environ["MASTER_PORT"])
@@ -559,6 +567,7 @@ class Manager:
             checkpoint_metadata=self._checkpoint_transport.metadata(),
             shrink_only=shrink_only,
             timeout=quorum_timeout,
+            init_sync=self._init_sync,
         )
 
         quorum_id = quorum.quorum_id
