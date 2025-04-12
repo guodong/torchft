@@ -30,3 +30,8 @@ dist/
 
 # Torch
 cifar/
+
+# Warren
+.cursor
+.shell_scripts
+

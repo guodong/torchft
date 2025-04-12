@@ -1,18 +1,18 @@
 import threading
 from datetime import timedelta
+from time import sleep
 from unittest import TestCase, skipUnless
 
 import torch
 from torch.futures import Future
 
-from torchft.futures.timeout import (
-    _TIMEOUT_MANAGER,
+from torchft.futures import (
     context_timeout,
     future_timeout,
     future_wait,
     stream_timeout,
 )
-
+from torchft.futures.failure_manager import _FAILURE_MANAGER
 
 class FuturesTest(TestCase):
     def test_future_wait(self) -> None:
@@ -84,8 +84,8 @@ class FuturesTest(TestCase):
         torch.cuda.synchronize()
 
         # make sure that event is deleted on the deletion queue
-        item = _TIMEOUT_MANAGER._del_queue.get(timeout=10.0)
-        _TIMEOUT_MANAGER._del_queue.put(item)
+        item = _FAILURE_MANAGER._del_queue.get(timeout=10.0)
+        _FAILURE_MANAGER._del_queue.put(item)
         del item
 
-        self.assertEqual(_TIMEOUT_MANAGER._clear_del_queue(), 1)
+        self.assertEqual(_FAILURE_MANAGER._clear_del_queue(), 1)

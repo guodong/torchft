@@ -1,157 +1,11 @@
-import asyncio
-import queue
-import sys
 import threading
 from contextlib import contextmanager
 from datetime import timedelta
-from typing import Callable, Generator, Optional, TypeVar
-from unittest.mock import Mock
-
-import torch
+from typing import Callable, Generator, TypeVar
 from torch.futures import Future
-
-from torchft.futures.EventsManager import _EventsManager
+from torchft.futures.failure_manager import _FAILURE_MANAGER, TIMEOUT_EVENT
 
 T = TypeVar("T")
-
-class _TimerHandle:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._timer_handle: Optional[asyncio.TimerHandle] = None
-        self._cancelled = False
-
-    def set_timer_handle(self, timer_handle: asyncio.TimerHandle) -> None:
-        with self._lock:
-            if self._cancelled:
-                timer_handle.cancel()
-                self._timer_handle = None
-            else:
-                self._timer_handle = timer_handle
-
-    def cancel(self) -> None:
-        with self._lock:
-            assert not self._cancelled, "timer can only be cancelled once"
-            self._cancelled = True
-            if self._timer_handle is not None:
-                self._timer_handle.cancel()
-                self._timer_handle = None
-
-class _TimeoutManager(_EventsManager):
-    """
-    This class manages timeouts for code blocks, futures and CUDA events. It
-    uses a background thread with an event loop to schedule the timeouts and
-    call the callback function when the timeout is reached.
-
-    Generally there is a single instance of this class that is used for all
-    timeouts. The callbacks should not block otherwise other timeouts may not
-    be processed.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._next_timer_id = 0
-
-        # This queue is used to delete events on the main thread as cudaEventDestroy
-        # can block if the CUDA queue is full.
-        self._del_queue: queue.SimpleQueue[object] = queue.SimpleQueue()
-
-
-    def register(self, fut: Future[T], timeout: timedelta) -> Future[T]:
-        """
-        Registers a future that will be cancelled after the specified timeout.
-        """
-        # bypass timeout for mock futures
-        if isinstance(fut, Mock):
-            return fut
-
-        self._clear_del_queue()
-
-        loop = self._maybe_start_event_loop()
-
-        # pyre-fixme[29]: Future is not a function
-        timed_fut: Future[T] = Future()
-        handle: _TimerHandle = _TimerHandle()
-        loop.call_soon_threadsafe(
-            self._register_callback,
-            loop,
-            lambda: timed_fut.set_exception(
-                # pyre-fixme[6]: e is not T
-                TimeoutError(f"future did not complete within {timeout}")
-            ),
-            timeout,
-            handle,
-        )
-
-        def callback(fut: Future[T]) -> None:
-            handle.cancel()
-            try:
-                timed_fut.set_result(fut.wait())
-            except Exception as e:
-                try:
-                    # this can throw if the future is already done
-                    # pyre-fixme[6]: e is not T
-                    timed_fut.set_exception(e)
-                except Exception:
-                    pass
-
-        fut.add_done_callback(callback)
-        return timed_fut
-
-    def stream_timeout(self, callback: Callable[[], None], timeout: timedelta) -> None:
-        self._clear_del_queue()
-
-        loop = self._maybe_start_event_loop()
-
-        event: torch.cuda.Event = torch.cuda.Event()
-        event.record()
-
-        def handler() -> None:
-            if not event.query():
-                callback()
-
-            # cudaEventDestroy can block so we never want to delete in the event
-            # loop. Put it on the del queue so we can delete it in the main
-            # thread.
-            self._del_queue.put(event)
-
-        loop.call_soon_threadsafe(
-            self._register_callback, loop, handler, timeout, _TimerHandle()
-        )
-
-    @classmethod
-    def _register_callback(
-        cls,
-        loop: asyncio.AbstractEventLoop,
-        callback: Callable[[], None],
-        timeout: timedelta,
-        handle: _TimerHandle,
-    ) -> None:
-        timer_handle = loop.call_later(
-            timeout.total_seconds(),
-            callback,
-        )
-        handle.set_timer_handle(timer_handle)
-
-    @contextmanager
-    def context_timeout(
-        self, callback: Callable[[], None], timeout: timedelta
-    ) -> Generator[None, None, None]:
-        self._clear_del_queue()
-
-        loop = self._maybe_start_event_loop()
-        handle = _TimerHandle()
-
-        loop.call_soon_threadsafe(
-            self._register_callback, loop, callback, timeout, handle
-        )
-
-        yield
-
-        handle.cancel()
-
-_TIMEOUT_MANAGER = _TimeoutManager()
-
-
 
 def future_timeout(fut: Future[T], timeout: timedelta) -> Future[T]:
     """
@@ -165,7 +19,7 @@ def future_timeout(fut: Future[T], timeout: timedelta) -> Future[T]:
     Returns:
         The future with a timeout
     """
-    return _TIMEOUT_MANAGER.register(fut, timeout)
+    return _FAILURE_MANAGER.register(fut, TIMEOUT_EVENT, timeout)
 
 
 def future_wait(fut: Future[T], timeout: timedelta) -> T:
@@ -210,7 +64,7 @@ def stream_timeout(callback: Callable[[], None], timeout: timedelta) -> None:
         callback: The callback to call if the stream doesn't complete in time.
         timeout: The timeout to wait for the stream to complete.
     """
-    _TIMEOUT_MANAGER.stream_timeout(callback, timeout)
+    _FAILURE_MANAGER.stream_timeout(callback, timeout)
 
 
 @contextmanager
@@ -226,5 +80,5 @@ def context_timeout(
         timeout: How long to wait for the contextmanager to exit.
     """
 
-    with _TIMEOUT_MANAGER.context_timeout(callback, timeout):
+    with _FAILURE_MANAGER.context_timeout(callback, timeout):
         yield
