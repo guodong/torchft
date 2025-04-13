@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 from datetime import timedelta
-
+from time import sleep
 import torch
 import torch.nn.functional as F
 import torchvision
@@ -116,8 +116,9 @@ def main() -> None:
 
     # You can use an epoch based training but with faults it's easier to use step
     # based training.
-    while True:
+    while True: 
         for i, (inputs, labels) in enumerate(trainloader):
+            sleep(1)
             inputs = inputs.to(device)
             labels = labels.to(device)
 

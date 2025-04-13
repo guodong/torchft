@@ -4,8 +4,6 @@ from contextlib import contextmanager
 from datetime import timedelta
 from typing import Callable, Generator, TypeVar, Optional
 from unittest.mock import Mock
-
-from attr import Out
 from torchft.futures.events_manager import _EventsManager
 import torch
 from torch.futures import Future
@@ -15,6 +13,10 @@ T = TypeVar("T")
 
 TIMEOUT_EVENT = "timeout"
 IMMEDIATE_INTERRUPT_EVENT = "immediate_interrupt"
+
+class ImmediateInterruptException(Exception):
+    """Exception raised when a future is immediately interrupted."""
+    pass
 
 class _FailureManager(_EventsManager):
     """
@@ -35,6 +37,8 @@ class _FailureManager(_EventsManager):
         # can block if the CUDA queue is full.
         self._del_queue: queue.SimpleQueue[object] = queue.SimpleQueue()
 
+        self._timer_handle = None
+
     def register(self, fut: Future[T], event_type: Optional[str], timeout: timedelta) -> Future[T]:
         """
         Registers a future that will be cancelled after the specified timeout.
@@ -48,9 +52,9 @@ class _FailureManager(_EventsManager):
         loop = self._maybe_start_event_loop()
 
         if event_type == TIMEOUT_EVENT:
-            self.register_timeout(loop, fut, timeout)
-        if event_type == "immediate_interrupt":
-            self.register_immediate_interrupt(loop, fut)
+            return self.register_timeout(loop, fut, timeout)
+        if event_type == IMMEDIATE_INTERRUPT_EVENT:
+            return self.register_immediate_interrupt(loop, fut)
         else:
             raise ValueError(f"Invalid event type: {event_type}")
 
@@ -63,7 +67,8 @@ class _FailureManager(_EventsManager):
             IMMEDIATE_INTERRUPT_EVENT,
             loop,
             lambda: interrupted_fut.set_exception(
-                TimeoutError("immediate interrupt")
+                # pyre-fixme[6]: e is not T
+                ImmediateInterruptException("immediate interrupt")
             ),
             None,
             handle,
@@ -86,19 +91,26 @@ class _FailureManager(_EventsManager):
 
 
     def register_timeout(self, loop: asyncio.AbstractEventLoop, fut: Future[T], timeout: timedelta) -> None:
+        """
+        Register a timeout for a future.
+        Overwrites any existing timeout.
+        
+        If the future is already done, the timed_fut will be done immediately.
+        """
         # pyre-fixme[29]: Future is not a function
         timed_fut: Future[T] = Future()
         handle: _TimerHandle = _TimerHandle()
+
         loop.call_soon_threadsafe(
             self._register_callback,
-            TIMEOUT_EVENT,
             loop,
+            TIMEOUT_EVENT,
             lambda: timed_fut.set_exception(
                 # pyre-fixme[6]: e is not T
                 TimeoutError(f"future did not complete within {timeout}")
             ),
-            timeout,
             handle,
+            timeout,
         )
 
         def callback(fut: Future[T]) -> None:
@@ -116,19 +128,20 @@ class _FailureManager(_EventsManager):
         fut.add_done_callback(callback)
         return timed_fut
 
-
     @classmethod
     def _register_callback(
         cls,
         loop: asyncio.AbstractEventLoop,
         event_type: Optional[str],
         callback: Callable[[], None],
-        timeout: timedelta,
-        handle: _TimerHandle,
+        handle: _Handle,
+        timeout: Optional[timedelta] = None,
     ) -> None:
         if event_type == TIMEOUT_EVENT:
+            if timeout is None:
+                raise ValueError("Timeout is required for timeout event")
             cls._register_callback_timeout(loop, callback, timeout, handle)
-        elif event_type == "immediate_interrupt":
+        elif event_type == IMMEDIATE_INTERRUPT_EVENT:
             cls._register_callback_immediate_interrupt(loop, callback, handle)
         else:
             raise ValueError(f"Invalid event type: {event_type}")
@@ -153,13 +166,15 @@ class _FailureManager(_EventsManager):
             loop: asyncio.AbstractEventLoop,
             callback: Callable[[], None],
             timeout: timedelta,
-            handle: _TimerHandle
+            handle: _Handle
     ) -> None:
 
         timer_handle = loop.call_later(
             timeout.total_seconds(),
             callback,
         )
+        if not isinstance(timer_handle, asyncio.TimerHandle):
+            raise TypeError("timer_handle must be an instance of asyncio.TimerHandle")
         handle.set_timer_handle(timer_handle)
 
     def stream_timeout(self, callback: Callable[[], None], timeout: timedelta) -> None:
@@ -180,9 +195,10 @@ class _FailureManager(_EventsManager):
             self._del_queue.put(event)
 
         loop.call_soon_threadsafe(
-            self._register_callback, loop, handler, timeout, _TimerHandle()
+            self._register_callback, loop, TIMEOUT_EVENT, handler, _TimerHandle(), timeout
         )
 
+    @contextmanager
     def context_timeout(
         self, callback: Callable[[], None], timeout: timedelta
     ) -> Generator[None, None, None]:
@@ -192,7 +208,7 @@ class _FailureManager(_EventsManager):
         handle = _TimerHandle()
 
         loop.call_soon_threadsafe(
-            self._register_callback, loop, callback, timeout, handle
+            self._register_callback, loop, TIMEOUT_EVENT, callback, handle, timeout
         )
 
         yield
