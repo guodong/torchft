@@ -15,7 +15,7 @@ class ErrorBus():
 
     Note: c10d uses `activeOpLock_` to guarantee that only one op is active at a time. Thus the `get()` operation
     will block the compare_set operation, we use two TCPStore clients as a work around, 
-    one for boradcasting and one for receiving.
+    one for broadcasting and one for receiving.
     """
 
     # Prefix for TCPStore, used to avoid key collision
@@ -77,9 +77,9 @@ class ErrorBus():
             self._current_read_index = keys_count
 
     def register_callback(self, callback: callable) -> None:
-        self._callback = callable
+        self._callback = callback
 
-    def boradcast(self, message: str) -> str | None:
+    def broadcast(self, message: str) -> str | None:
         """
         Broadcast message to the error bus.
         Returns the key of the set value, or None on error.
@@ -89,7 +89,7 @@ class ErrorBus():
                 key = self._safe_set(message)
                 return key
         except Exception as e:
-            logging.error(f"Error in boradcast: {e}")
+            logging.error(f"Error in broadcast: {e}")
             return None
 
     def _safe_set(self, value: str) -> str:
@@ -133,7 +133,7 @@ class ErrorBus():
                 self._current_read_index += 1
 
                 ####
-                # If no exception is raised, we can safely move to the next index for boradcasting
+                # If no exception is raised, we can safely move to the next index for broadcasting
                 # Warnning! Broadcast is invoked in main thread, may lead to write_index plus twice
                 ####
                 # self._current_write_index = self._current_read_index
@@ -184,7 +184,7 @@ if __name__ == '__main__':
         m_idx = 0
         while True:
             try:
-                eb.boradcast(f'err {m_idx}')
+                eb.broadcast(f'err {m_idx}')
                 m_idx += 1
                 time.sleep(1)
             except KeyboardInterrupt:
