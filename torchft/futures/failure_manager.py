@@ -1,18 +1,27 @@
 import asyncio
+from math import e
 import queue
 from contextlib import contextmanager
 from datetime import timedelta
-from typing import Callable, Generator, TypeVar, Optional
+from typing import Callable, Generator, TypeVar, Optional, Dict, Any, TYPE_CHECKING
 from unittest.mock import Mock
 from torchft.futures.events_manager import _EventsManager
 import torch
 from torch.futures import Future
 from torchft.futures.timer_handle import _TimerHandle, _Handle
 
+if TYPE_CHECKING:
+    from torchft.process_group import ProcessGroupBaby
+
 T = TypeVar("T")
 
 TIMEOUT_EVENT = "timeout"
 IMMEDIATE_INTERRUPT_EVENT = "immediate_interrupt"
+
+class _FailureMetadata:
+    def __init__(self, pg: "ProcessGroupBaby", id: int):
+        self._pg = pg
+        self._id = id
 
 class ImmediateInterruptException(Exception):
     """Exception raised when a future is immediately interrupted."""
@@ -38,13 +47,20 @@ class _FailureManager(_EventsManager):
         self._del_queue: queue.SimpleQueue[object] = queue.SimpleQueue()
 
         self._timer_handle = None
+        self._metadata_dict: Dict[int, _FailureMetadata] = {}
 
-    def register(self, fut: Future[T], event_type: Optional[str], timeout: timedelta) -> Future[T]:
+    def on_event(self, fut: Future[T], event_type: Optional[str], pg: Optional["ProcessGroupBaby"] = None, timeout: Optional[timedelta] = None) -> Future[T]:
         """
-        Registers a future that will be cancelled after the specified timeout.
+        Registers the event on the future and returns a new future
+        that will complete when the original future completes or the event fires.
+
+        If the future is already done, returns the future immediately.
         """
         # bypass timeout for mock futures
         if isinstance(fut, Mock):
+            return fut
+
+        if fut.done():
             return fut
 
         self._clear_del_queue()
@@ -54,41 +70,33 @@ class _FailureManager(_EventsManager):
         if event_type == TIMEOUT_EVENT:
             return self.register_timeout(loop, fut, timeout)
         if event_type == IMMEDIATE_INTERRUPT_EVENT:
-            return self.register_immediate_interrupt(loop, fut)
+            if pg is not None:
+                return self.immediate_interrupt(fut, pg)
+            else:
+                raise ValueError("Process group is required for immediate interrupt")
         else:
             raise ValueError(f"Invalid event type: {event_type}")
 
-    def register_immediate_interrupt(self, loop: asyncio.AbstractEventLoop, fut: Future[T]) -> None:
+    def immediate_interrupt(self, fut: Future[T], pg: Optional["ProcessGroupBaby"] = None) -> Future[T]:
+        """
+        Sets the future to raise ImmediateInterruptException.
+        """
         # pyre-fixme[29]: Future is not a function
-        interrupted_fut: Future[T] = Future()
-        handle: _Handle = _Handle()
-        loop.call_soon_threadsafe(
-            self._register_callback,
-            IMMEDIATE_INTERRUPT_EVENT,
-            loop,
-            lambda: interrupted_fut.set_exception(
-                # pyre-fixme[6]: e is not T
-                ImmediateInterruptException("immediate interrupt")
-            ),
-            None,
-            handle,
-        )
+        _timer_handle = self._timer_handle
+        if _timer_handle is not None:
+            _timer_handle.cancel()
+        fut.set_exception(ImmediateInterruptException("immediate interrupt"))
+        if pg is not None:
+            self.rollback(event_type=IMMEDIATE_INTERRUPT_EVENT, pg=pg)
+        else:
+            raise ValueError("Process group is required for immediate interrupt")
+        return fut
 
-        def callback(fut: Future[T]) -> None:
-            handle.cancel()
-            try:
-                interrupted_fut.set_result(fut.wait())
-            except Exception as e:
-                try:
-                    # this can throw if the future is already done
-                    # pyre-fixme[6]: e is not T
-                    interrupted_fut.set_exception(e)
-                except Exception:
-                    pass
-
-        fut.add_done_callback(callback)
-        return interrupted_fut
-
+    def rollback(self, event_type: Optional[str], pg: Optional["ProcessGroupBaby"]):
+        if event_type == IMMEDIATE_INTERRUPT_EVENT:
+            pg.abort()
+        else:
+            raise ValueError(f"Rollback logic not implemented for event type: {event_type}")
 
     def register_timeout(self, loop: asyncio.AbstractEventLoop, fut: Future[T], timeout: timedelta) -> None:
         """

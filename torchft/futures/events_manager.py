@@ -2,9 +2,13 @@ import asyncio
 import queue
 import sys
 import threading
-from typing import Optional, TypeVar
+from datetime import timedelta
+from typing import Optional, TypeVar, TYPE_CHECKING
 from abc import ABC, abstractmethod
 from torch.futures import Future
+
+if TYPE_CHECKING:
+    from torchft.process_group import ProcessGroupBaby
 
 T = TypeVar("T")
 
@@ -41,13 +45,18 @@ class _EventsManager(ABC):
 
 
     @abstractmethod
-    def register(self, fut: Future[T], event_type: Optional[str]) -> Future[T]:
+    def on_event(self, fut: Future[T], event_type: Optional[str], pg: Optional["ProcessGroupBaby"] = None, timeout: Optional[timedelta] = None) -> Future[T]:
         """
-        Registers an event on the event loop with a callback that augments
-        the future's completion.
+        Calls the appropriate method to respond to the event. 
 
-        This allows for communication of background threads with the main thread
-        when the main thread calls fut.wait() on the returned future.
+        Args:
+            fut: The future to register an event on
+            event_type: The type of event to register (e.g. "timeout", "immediate_interrupt")
+            pg: The process group to use (required for some event types)
+            timeout: The timeout duration (required for timeout events)
+            
+        Returns:
+            A new future that will complete when the original future completes or the event fires
         """
         pass
 

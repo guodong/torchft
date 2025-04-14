@@ -1,15 +1,9 @@
+TODOs:
+
+1. Add retry logic. This needs to be at the top level
+
+
 1. Race Condition Handling
-
--  When I have register_immediate_interrupt after I register_timeout. 
-    - Cancel timeout_handle at `register_immediate_interrupt`
-
-2. What if I did `register_timeout` after `register_immediate_interrupt?` Is this possible?
-    - Potentially so?
-    - After register_timeout, I schedule the timeout onto the event loop on the next run.
-    - Since it is call_soon_thread_safe, there shouldn't be much problem?
-    Two scenarios: I did call_soon_thread_safe register callback timeout before interrupt, and vice versa.
-
-3. 
 
 If call `interrupt` after `timeout`, then we are interrupting the timed_fut and 
 
@@ -17,6 +11,24 @@ As long as we set exception on the timed_fut, we should be ok?
 
 
 1. For a single `interruptable_future`, do I need to lock it when modifying the underlying future? Or this is actually not needed?
+
+My current idea is the following: 
+
+I definitely need to lock it when I do _FAILURE_MANAGER.register(IMMEDIATE_INTERRUPT_EVENT), since my IMMEDIATE INTERRUPT event is total
+- But for all the other methods acting on the future, then, I need to check whether my current future is good or not. 
+
+For add_timeout, I should also have the lock for the whole thing to go through.
+
+For wait, it is weird because I should have the lock when I do current_future.wait(). The problem here is that it is waiting on the older one.
+
+My current strategy is the following:
+
+Every time I call add_timeout or immediate_interrupt, I return a new future. This new future's 
+
+I think I figured out the strategy: 
+
+Whenever I add timeout, I should return a new timed_fut object. Howver, whenever I am doing anything else. I shoudln't. 
+
 
 
 
