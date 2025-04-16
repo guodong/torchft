@@ -35,7 +35,7 @@ from torchft import (
     
 )
 
-from torchft.local_sgd import DiLoCo
+from torchft.local_sgd_v2 import DiLoCo
 from torchft.process_group import ManagedProcessGroup, ft_init_device_mesh
 
 # from torchft.checkpointmanager import CkptManager

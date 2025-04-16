@@ -26,7 +26,6 @@ from torch.distributed.tensor import DeviceMesh, distribute_tensor
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-import copy
 
 class LocalSGD:
     """
@@ -171,8 +170,6 @@ class DiLoCo:
         if_shard: bool = False,
         rpg_id: int = 0,
         local_rank: int = 0,
-        num_rg: int = 2
-        # eager_mode: bool = False
     ) -> None:
         if manager._use_async_quorum:
             raise ValueError(
@@ -188,45 +185,31 @@ class DiLoCo:
         assert sync_every >= 1, "sync_every must be greater than or equal to 1"
         self._backup_device = backup_device
         self._pin_memory = pin_memory
-        
+
         self._off_load = off_load
         self._if_shard = if_shard
         self.async_future = None
-        # self._eager = eager_mode
-        self.works = []
-        self.num_rg = num_rg
 
         self._hooks: List[RemovableHandle] = []
         self._outer_optimizer = outer_optimizer
         self.original_parameters: Dict[str, torch.Tensor] = {}
-        self.original_grads: Dict[str, torch.Tensor] = {}
-        
         for name, p in self._model.named_parameters():
-            t1 = torch.empty(*tuple(p.shape), dtype=p.dtype, device=self._backup_device)
+            t = torch.empty(*tuple(p.shape), dtype=p.dtype, device=self._backup_device)
             if (
                 self._pin_memory
-                and t1.device == torch.device("cpu")
+                and t.device == torch.device("cpu")
                 and torch.cuda.is_available()
             ):
-                t1 = t1.pin_memory()
-            self.original_parameters[name] = t1
-
-            t2 = torch.empty(*tuple(p.grad.shape), dtype=p.dtype, device=self._backup_device)
-            if (
-                self._pin_memory
-                and t2.device == torch.device("cpu")
-                and torch.cuda.is_available()
-            ):
-                t2 = t2.pin_memory()
-            self.original_grads[name] = t2
+                t = t.pin_memory()
+            self.original_parameters[name] = t
 
         # Need to copy the parameters to the host to be safe if we are on the first step.
         self._save_parameters()
         # if off_load:
         #     self.params_offloaded = self.get_offloaded_param(self._outer_optimizer)
 
-        # self.states=self._manager.state_dict()
-        # self.checkpoint_id="/srv/apps/danny/ckpt/"+f"replica_group_{rpg_id}/"+f"local_rank_{local_rank}"
+        self.states=self._manager.state_dict()
+        self.checkpoint_id="/srv/apps/danny/ckpt/"+f"replica_group_{rpg_id}/"+f"local_rank_{local_rank}"
 
     def get_offloaded_param(outer_optimizer: torch.optim.Optimizer):
         return [
@@ -242,7 +225,6 @@ class DiLoCo:
             for name, p in self._model.named_parameters():
                 # self.original_parameters[name].copy_(p.data.to_local(), non_blocking=True)
                 self.original_parameters[name].copy_(p.data, non_blocking=True)
-                self.original_grads[name].copy_(p.grad,non_blocking=True)
 
     def _restore_parameters(self) -> None:
         with torch.no_grad():
@@ -290,14 +272,14 @@ class DiLoCo:
         self._perform_sync()
         self._local_step = 0
 
-        # self._async_wait()
-        # self.async_future = dcp.async_save(
-        #         self.states, checkpoint_id=self.checkpoint_id, process_group=self._manager._pg
-        #     )
+        self._async_wait()
+        self.async_future = dcp.async_save(
+                self.states, checkpoint_id=self.checkpoint_id, process_group=self._manager._pg
+            )
 
-    # def _async_wait(self):
-    #     if self.async_future != None:
-    #         self.async_future.result()
+    def _async_wait(self):
+        if self.async_future != None:
+            self.async_future.result()
 
 
     def _perform_sync(self) -> None:
@@ -306,77 +288,38 @@ class DiLoCo:
         step using the outer optimizer.
         """
         # Set the .grad field of each parameter to its pseudogradient
-        
-        self.sendout_model = copy.deepcopy(self._model).to("cuda")
-        if self.works!=[]:
-            if self._off_load:
-                for name, _ in self._model.named_parameters():
-                    self.original_parameters[name] = self.original_parameters[name].to("cuda")
-                    self.original_grads[name] = self.original_grads[name].to("cuda")
-            for work in self.works:
-                work.wait()
-            fresh_grad={}
-            for name, p in self.sendout_model.named_parameters():
-                fresh_grad[name] = p.grad
+        if self._off_load:
+            for name, _ in self._model.named_parameters():
+                self.original_parameters[name] = self.original_parameters[name].to("cuda")
+        for name, p in self._model.named_parameters():
+            pseudogradient = p.data - self.original_parameters[name]
+            p.grad = pseudogradient
 
-            for name, p in self._model.named_parameters():
-                fresh_grad[name] += 1/self.num_rg*(p.grad-self.original_grads[name])
-                p.grad = fresh_grad[name]
-
-        else:
-            for name, p in self.sendout_model.named_parameters():
-                pseudogradient =p - self.original_parameters[name]
-                p.grad = pseudogradient
-            new_works = self._average_grads(asy=True)
-            self.works = new_works
-            return
-
+        self._average_grads()
         # Restore the parameters back to the previous state
         self._restore_parameters()
         
-        flag = 0
         if self._manager.should_commit():
             # Use the outer optimizer to update the model parameters
             self._outer_optimizer.step()
-            for name, p in self.sendout_model.named_parameters():
-                pseudogradient =p - self.original_parameters[name]
-                p.grad = pseudogradient
-            self._save_parameters()  #also including original_grads,sendout_models
-        else:
-            flag = 1
+            self._save_parameters()
 
         if self._off_load:
             for name, _ in self._model.named_parameters():
                 self.original_parameters[name] = self.original_parameters[name].to("cpu")
-                self.original_grads[name] = self.original_grads[name].to("cpu")
 
         self._outer_optimizer.zero_grad()
-        
-        if flag == 0:
-            new_works = self._average_grads(asy=True)
-            self.works = new_works
-        else:
-            self.works=[]
 
-    def _average_grads(self,asy:bool = False) -> None:
+    def _average_grads(self) -> None:
         """
         Average the gradients across the diloco group.
         """
         works = []
-        if not asy:
-            for p in self._model.parameters():
-                # Perform allreduce on the pseudogradients
-                assert p.grad is not None
-                work = self._manager.allreduce(p.grad)
-                works.append(work)
-            # Wait for all allreduce operations to complete
-
-            for work in works:
-                work.wait()
-        else:
-            for p in self.sendout_model.parameters():
-                # Perform allreduce on the pseudogradients
-                assert p.grad is not None
-                work = self._manager.allreduce(p.grad)
-                works.append(work)
-            return works
+        for p in self._model.parameters():
+            # Perform allreduce on the pseudogradients
+            assert p.grad is not None
+            work = self._manager.allreduce(p.grad)
+            works.append(work)
+        # Wait for all allreduce operations to complete
+        for work in works:
+            work.wait()

@@ -20,10 +20,6 @@ from torch.utils.hooks import RemovableHandle
 
 from torchft.manager import Manager
 
-import torch.distributed.checkpoint as dcp
-
-from torch.distributed.tensor import DeviceMesh, distribute_tensor
-
 logger: logging.Logger = logging.getLogger(__name__)
 
 
@@ -166,10 +162,6 @@ class DiLoCo:
         sync_every: int,
         backup_device: Optional[torch.device] = None,
         pin_memory: bool = True,
-        off_load: bool = False,
-        if_shard: bool = False,
-        rpg_id: int = 0,
-        local_rank: int = 0,
     ) -> None:
         if manager._use_async_quorum:
             raise ValueError(
@@ -186,13 +178,10 @@ class DiLoCo:
         self._backup_device = backup_device
         self._pin_memory = pin_memory
 
-        self._off_load = off_load
-        self._if_shard = if_shard
-        self.async_future = None
-
         self._hooks: List[RemovableHandle] = []
         self._outer_optimizer = outer_optimizer
         self.original_parameters: Dict[str, torch.Tensor] = {}
+        #这里怎么和ckpt saving结合起来？
         for name, p in self._model.named_parameters():
             t = torch.empty(*tuple(p.shape), dtype=p.dtype, device=self._backup_device)
             if (
@@ -205,25 +194,11 @@ class DiLoCo:
 
         # Need to copy the parameters to the host to be safe if we are on the first step.
         self._save_parameters()
-        # if off_load:
-        #     self.params_offloaded = self.get_offloaded_param(self._outer_optimizer)
-
-        self.states=self._manager.state_dict()
-        self.checkpoint_id="/srv/apps/danny/ckpt/"+f"replica_group_{rpg_id}/"+f"local_rank_{local_rank}"
-
-    def get_offloaded_param(outer_optimizer: torch.optim.Optimizer):
-        return [
-            param.data.detach().clone().to("cpu")
-            for group in outer_optimizer.param_groups
-            for param in group["params"]
-        ]
 
     def _save_parameters(self) -> None:
         with torch.no_grad():
             # TODO: consider running copy on a separate stream
-            # TODO: to_local could cause error
             for name, p in self._model.named_parameters():
-                # self.original_parameters[name].copy_(p.data.to_local(), non_blocking=True)
                 self.original_parameters[name].copy_(p.data, non_blocking=True)
 
     def _restore_parameters(self) -> None:
@@ -253,7 +228,7 @@ class DiLoCo:
 
         return False  # Propagate exceptions
 
-    def _step_post_hook(
+    def _step_post_hook(  #只有inner optimizer被挂上了hook
         self, _optim: optim.Optimizer, _args: Tuple[Any, ...], _kwargs: Dict[str, Any]
     ) -> None:
         """
@@ -267,20 +242,9 @@ class DiLoCo:
         """
         Synchronizes and averages the model weights across the manager.
         """
-        self._manager.start_quorum()
-
+        self._manager.start_quorum()  #
         self._perform_sync()
         self._local_step = 0
-
-        self._async_wait()
-        self.async_future = dcp.async_save(
-                self.states, checkpoint_id=self.checkpoint_id, process_group=self._manager._pg
-            )
-
-    def _async_wait(self):
-        if self.async_future != None:
-            self.async_future.result()
-
 
     def _perform_sync(self) -> None:
         """
@@ -288,26 +252,18 @@ class DiLoCo:
         step using the outer optimizer.
         """
         # Set the .grad field of each parameter to its pseudogradient
-        if self._off_load:
-            for name, _ in self._model.named_parameters():
-                self.original_parameters[name] = self.original_parameters[name].to("cuda")
         for name, p in self._model.named_parameters():
             pseudogradient = p.data - self.original_parameters[name]
             p.grad = pseudogradient
 
+
         self._average_grads()
         # Restore the parameters back to the previous state
-        self._restore_parameters()
-        
+        self._restore_parameters()  #回到h个innerstep之前的状态 
         if self._manager.should_commit():
             # Use the outer optimizer to update the model parameters
             self._outer_optimizer.step()
-            self._save_parameters()
-
-        if self._off_load:
-            for name, _ in self._model.named_parameters():
-                self.original_parameters[name] = self.original_parameters[name].to("cpu")
-
+            self._save_parameters()   #把当前的状态保存下来
         self._outer_optimizer.zero_grad()
 
     def _average_grads(self) -> None:

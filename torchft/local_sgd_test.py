@@ -11,7 +11,7 @@ from unittest.mock import create_autospec
 import torch
 from torch import nn, optim
 
-from torchft.local_sgd import DiLoCo, LocalSGD
+from torchft.local_sgd_v2 import DiLoCo, LocalSGD
 from torchft.manager import Manager
 
 
