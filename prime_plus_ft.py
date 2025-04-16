@@ -183,7 +183,7 @@ def main() -> None:
     # TODO: find out whether this line should be added, otherwise, "pseudogradient = p.data - self.original_parameters[name]" could cause semantic error
     loss_batch = 0
     with DiLoCo(
-            manager, m, inner_optimizer, outer_optimizer, sync_every=30,backup_device=torch.device("cpu"),off_load=True,
+            manager, m, inner_optimizer, outer_optimizer, sync_every=3,backup_device=torch.device("cpu"),off_load=True,
             rpg_id=REPLICA_GROUP_ID,local_rank=local_rank) as diloco:
 
         for step, batch in enumerate(iterable=trainloader):
