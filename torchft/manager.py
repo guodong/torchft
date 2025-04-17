@@ -29,6 +29,7 @@ from ast import Store
 import concurrent.futures
 import logging
 import os
+import signal
 import socket
 import threading
 import time
@@ -44,6 +45,8 @@ from torch.distributed import ReduceOp, TCPStore
 
 from torchft._torchft import ManagerClient, ManagerServer
 from torchft.checkpointing import CheckpointTransport, HTTPTransport
+from torchft.distributed.messaging.error_bus import ErrorBus
+from torchft.distributed.messaging.message import ErrorMessage, GPUErrorMessage
 from torchft.futures import future_timeout
 from torchft.error_bus import ManagedErrorBus, Message as ErrorBusMessage, ErrorChannel
 
@@ -168,16 +171,16 @@ class Manager:
         self._error_bus_daemon = error_bus_daemon 
         self._error_bus_channel: Optional[ErrorChannel] = None
         self._error_bus_listening_thread: Optional[threading.Thread] = None
-        if self._enable_error_bus:
-            self._error_bus = ManagedErrorBus(
-                manager=self,
-                name=f"ManagedErrorBus-{self._replica_id}",
-                debug=self._error_bus_debug,
-                daemon=self._error_bus_daemon,
-                queue_size=self._error_bus_queue_size,
-            )
-        else:
-            self._error_bus = None
+        # if self._enable_error_bus:
+        #     self._error_bus = ManagedErrorBus(
+        #         manager=self,
+        #         name=f"ManagedErrorBus-{self._replica_id}",
+        #         debug=self._error_bus_debug,
+        #         daemon=self._error_bus_daemon,
+        #         queue_size=self._error_bus_queue_size,
+        #     )
+        # else:
+        #     self._error_bus = None
 
         store_addr = store_addr or os.environ["MASTER_ADDR"]
         store_port = store_port or int(os.environ["MASTER_PORT"])
@@ -210,11 +213,12 @@ class Manager:
         self._manager: Optional[ManagerServer] = None
 
         if self._enable_error_bus:
-            self._error_bus_listening_thread = threading.Thread(
-                target=self._listen_for_error_bus,
-                daemon=True,
-            )
-            self._error_bus_listening_thread.start()
+            # TODO: why use elastic store not working? Bellow error bus cannot recv messages from cli. Why?
+            # self._error_bus = ErrorBus(host_name=store_addr, port=store_port, is_master=True, callback=self._error_bus_callback)
+
+            # TODO: Work around for testing error signal, use a dedicated error bus
+            self._error_bus = ErrorBus(host_name='127.0.0.1', port=22223, is_master=True, callback=self._error_bus_callback)
+            self._error_bus.run()
 
         self._recovery_stream: Optional["torch.cuda.Stream"] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
@@ -268,6 +272,20 @@ class Manager:
         self._participating_rank: Optional[int] = None
         self._participating_world_size: int = 0
 
+        # used to track the aborted step for short circuit optimizer.step() check
+        self._should_commit_short_circuit: bool = False
+
+        # error msg from error bus
+        self._error_msg: Optional[ErrorMessage] = None
+
+        def on_signal(signum: int, frame) -> None:
+            self._logger.info(
+                f"Received signal {signum} from error bus"
+            )
+            self._abort_step()
+        
+        signal.signal(signal.SIGUSR1, on_signal)
+
     def set_state_dict_fns(
         self, load_state_dict: Callable[[T], None], state_dict: Callable[[], T]
     ) -> None:
@@ -282,6 +300,15 @@ class Manager:
         if self._manager is not None:
             self._manager.shutdown()
         self._executor.shutdown(wait=wait)
+
+    def _error_bus_callback(self, error_msg: ErrorMessage) -> None:
+        """
+        Callback for the error bus that will be called when an error message is received.
+        Note: This is called in the error bus thread and should not block.
+        """
+        self._logger.info(f"Received message from error bus: message={error_msg}")
+        self._error_msg = error_msg
+        os.kill(os.getpid(), signal.SIGUSR1)
 
     def _listen_for_error_bus(self) -> None:
         """
@@ -327,9 +354,52 @@ class Manager:
                 # Brief sleep to prevent tight loop in case of persistent errors
                 time.sleep(0.1)
 
-    def _abort_local(self, error_msg: ErrorBusMessage) -> None:
-        self._pg.error_bus_abort(error_msg)
-    
+    def _abort_step(self) -> None:
+        """
+        Abort the current step based on error_msg.
+        """
+        def depend_on_device(host, gpu_index=None) -> bool:
+            """
+            TODO: Check if the current GPU is being used by the current process
+            """
+            return True
+        
+        if isinstance(self._error_msg, GPUErrorMessage):
+            if depend_on_device(self._error_msg.host_name, self._error_msg.gpu_index):
+                self._logger.info(f"Aborting current step due to GPU error {self._error_msg}")
+                self._abort_local() # TODO: abort current proc? or just os.exit()?
+            else:
+                self._logger.info(f"Skipping local process abort due to GPU error from others {self._error_msg}")
+                self._abort_local()
+                self.start_quorum() # TODO: check this
+
+    def _abort_local(self) -> None:
+        self._logger.info(f"Aborting local process")
+        def dist_step_transaction_done():
+            """
+            Dist step transaction means the tasks that require others to finish is done,
+            the remaining job does not relie on others.
+            For example, the loss.backward() is a dist step transaction
+
+            TODO: if current step is before optimizer.step(), the dist transaction is not done.
+            if current step finished backward without failure, the dist transaction is done,
+            and the step should not be abort.
+            """
+            return True
+        
+        if not dist_step_transaction_done():
+            self._quorum_future.cancel()
+
+            for work in self._pending_work:
+                work.set_exception(InterruptedError("Aborting local process"))
+
+            self._pending_work.clear()
+            self._should_commit_short_circuit = True
+
+            # TODO: reconfigure pg after adjusting the participats
+            self.start_quorum() # TODO: check this
+            self._pg.error_bus_abort(self._error_msg)
+
     def _broadcast(self, error_msg: ErrorBusMessage) -> None:
         if self._error_bus_channel is None:
             self._logger.warning("Error bus channel is not set")
@@ -696,6 +766,11 @@ class Manager:
         Returns:
             True if the optimizer should be stepped, False otherwise
         """
+        # Short circuit if we already know the step failed.
+        if self._should_commit_short_circuit:
+            self._should_commit_short_circuit = False
+            return
+        
         for work in self._pending_work:
             # check at the beginning of since .wait() may trigger errors
             if self._errored is not None:

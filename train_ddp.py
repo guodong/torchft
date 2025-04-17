@@ -86,6 +86,7 @@ def main() -> None:
         state_dict=state_dict,
         replica_id=f"train_ddp_{REPLICA_GROUP_ID}",
         timeout=timedelta(seconds=10),
+        enable_error_bus=True,
     )
 
     class Net(nn.Module):
@@ -118,7 +119,7 @@ def main() -> None:
     # based training.
     while True: 
         for i, (inputs, labels) in enumerate(trainloader):
-            sleep(1)
+            sleep(50)
             inputs = inputs.to(device)
             labels = labels.to(device)
 

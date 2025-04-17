@@ -6,6 +6,8 @@ import threading
 import time
 import torch.distributed as dist
 
+from torchft.distributed.messaging.message import Message
+
 
 class ErrorBus():
     """
@@ -142,9 +144,9 @@ class ErrorBus():
             except Exception as e:
                 logging.debug(f"Pooling message: {e}")
                 
-    def run_in_thread(self) -> None:
+    def run(self) -> None:
         """
-        Start the error bus in a separate thread, returns the thread object.
+        Start recv messages in a separate thread, returns the thread object.
         """
         thread = threading.Thread(target=self._run, daemon=True)
         thread.start()
@@ -154,8 +156,9 @@ class ErrorBus():
         while not self._shutdown_flag.is_set():
             try:
                 message = self.recv()
+                parsed = Message.deserialize(message)
                 if self._callback and callable(self._callback):
-                    self._callback(message)
+                    self._callback(parsed)
             except Exception as e:
                 logging.error(f"Error in run loop: {e}")
                 break
@@ -175,12 +178,12 @@ if __name__ == '__main__':
     if sys.argv[1] == 'master':
         try:
             eb = ErrorBus(port=port, is_master=True, callback=cb)
-            eb.run_in_thread().join()
+            eb.run().join()
         except KeyboardInterrupt:
             eb.shutdown()
     else:
         eb = ErrorBus(port=port, is_master=False, callback=cb)
-        eb.run_in_thread()
+        eb.run()
         m_idx = 0
         while True:
             try:
