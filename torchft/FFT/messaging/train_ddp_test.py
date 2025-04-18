@@ -4,6 +4,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+Simple training example using ManagerFFT with synthetic data.
+
+This example demonstrates how to use ManagerFFT in a distributed training setup
+without requiring torchvision or other external dataset dependencies.
+
+Usage:
+  python -m torch.distributed.run --nnodes=1 --nproc_per_node=2 train_ddp_test.py
+"""
+
 import logging
 import os
 import sys
@@ -11,39 +21,50 @@ from datetime import timedelta
 from time import sleep
 import torch
 import torch.nn.functional as F
-import torchvision
-import torchvision.transforms as transforms
 from torch import nn, optim
+from torch.utils.data import Dataset, DistributedSampler, StatefulDataLoader
 from torch.distributed.elastic.multiprocessing.errors import record
-from torchdata.stateful_dataloader import StatefulDataLoader
 
 from torchft import (
     DistributedDataParallel,
-    DistributedSampler,
-    Manager,
     Optimizer,
     ProcessGroupBabyNCCL,
     ProcessGroupGloo,
 )
+from torchft.manager_fft import ManagerFFT
 
 logging.basicConfig(level=logging.INFO)
+
+
+# Simple synthetic dataset
+class SyntheticDataset(Dataset):
+    def __init__(self, size=10000, dims=32, num_classes=10):
+        self.size = size
+        self.dims = dims
+        self.num_classes = num_classes
+        
+        # Generate random data and labels
+        self.data = torch.randn(size, 3, dims, dims)
+        self.labels = torch.randint(0, num_classes, (size,))
+    
+    def __len__(self):
+        return self.size
+    
+    def __getitem__(self, idx):
+        return self.data[idx], self.labels[idx]
 
 
 @record
 def main() -> None:
     REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
     NUM_REPLICA_GROUPS = int(os.environ.get("NUM_REPLICA_GROUPS", 2))
-
-    transform = transforms.Compose(
-        [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
-    )
-    trainset = torchvision.datasets.CIFAR10(
-        root="./cifar", train=True, download=True, transform=transform
-    )
-
-    # This shards the training set across all ranks and replica groups. We manage
-    # the dataloaders on a per replica group basis with the assumption that the
-    # majority of groups will be available so few batches will be dropped.
+    RANK = int(os.environ.get("RANK", 0))
+    WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+    
+    # Create synthetic dataset
+    trainset = SyntheticDataset(size=5000, dims=32, num_classes=10)
+    
+    # Create distributed sampler
     sampler = DistributedSampler(
         trainset,
         replica_group=REPLICA_GROUP_ID,
@@ -53,13 +74,13 @@ def main() -> None:
         num_replicas=1,
         shuffle=True,
     )
-
-    # This uses the torchdata StatefulDataLoader to be able to checkpoint and
-    # restore the per worker dataloader position.
+    
+    # Create dataloader
     trainloader = StatefulDataLoader(
         trainset, batch_size=64, num_workers=2, sampler=sampler
     )
-
+    
+    # Model state dict functions
     def load_state_dict(state_dict):
         m.load_state_dict(state_dict["model"])
         optimizer.load_state_dict(state_dict["optim"])
@@ -70,6 +91,7 @@ def main() -> None:
             "optim": optimizer.state_dict(),
         }
 
+    # Setup device and process group
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pg = (
         ProcessGroupBabyNCCL(
@@ -79,14 +101,19 @@ def main() -> None:
         else ProcessGroupGloo(timeout=timedelta(seconds=5))
     )
 
-    manager = Manager(
+    # Create ManagerFFT instead of Manager 
+    manager = ManagerFFT(
         pg=pg,
         min_replica_size=1,
         load_state_dict=load_state_dict,
         state_dict=state_dict,
-        replica_id=f"train_ddp_{REPLICA_GROUP_ID}",
+        replica_id=f"train_ddp_test_{REPLICA_GROUP_ID}",
+        rank=RANK,
+        world_size=WORLD_SIZE,
         timeout=timedelta(seconds=10),
-        enable_error_bus=True,
+        error_bus_host='127.0.0.1',
+        error_bus_port=22223,
+        error_bus_debug=True
     )
 
     class Net(nn.Module):
@@ -107,7 +134,6 @@ def main() -> None:
             x = F.relu(self.fc2(x))
             x = self.fc3(x)
             return x
-
     m = Net().to(device)
     m = DistributedDataParallel(manager, m)
     optimizer = Optimizer(manager, optim.AdamW(m.parameters()))
@@ -139,19 +165,11 @@ def main() -> None:
             if manager.current_step() % 100 == 0:
                 print(f"[{manager.current_step()}] loss = {loss.item()}")
 
-            # TODO (by the user): periodically checkpoint model, optim, manager and dataloader
-
-            # You typically want to checkpoint dataloader frequently (every step?) to
-            # avoid repeated batches as it's replica group specific.
-
-            # Model, optim and manager checkpoints can be done more infrequently as
-            # they're shared across all groups and will load from existing replicas as
-            # long as not every worker goes down.
-
             if manager.current_step() >= 10000:
                 # complete training
                 exit()
-
-
+            
+            sleep(2)
+        
 if __name__ == "__main__":
-    main()
+    main() 

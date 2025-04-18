@@ -23,6 +23,10 @@ from torchft.checkpointing._serialization import _streaming_load, _streaming_sav
 from torchft.checkpointing.transport import CheckpointTransport
 from torchft.http import _IPv6HTTPServer
 
+import os
+if os.getlogin() == 'fucheng':
+    from torchft.http import _IPv4HTTPServer
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -131,7 +135,10 @@ class HTTPTransport(CheckpointTransport[T]):
                     self.send_error(500, str(e))
 
         server_address = ("", 0)
-        self._server = _IPv6HTTPServer(server_address, RequestHandler)
+        if os.getlogin() == 'fucheng':
+            self._server = _IPv4HTTPServer(server_address, RequestHandler)
+        else:
+            self._server = _IPv6HTTPServer(server_address, RequestHandler)
         logger.info(f"Started CheckpointServer on {self.address()}...")
 
         self._thread = threading.Thread(
