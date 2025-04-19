@@ -106,14 +106,20 @@ class LocalSGD:
         """
         This hook is registered on the optimizer and is called after the optimizer step.
         """
+        if self._local_step == 0: # Optimization: sync on the first step.
+            self.sync()
+        print("FROM LOCAL SGD: _step_post_hook")
         self._local_step += 1
+        print(f"FROM LOCAL SGD: local_step: {self._local_step}, sync_every: {self._sync_every}")
         if self._local_step >= self._sync_every:
+            print("FROM LOCAL SGD: at step %d, syncing" % self._local_step)
             self.sync()
 
     def sync(self) -> None:
         """
         Synchronizes and averages the model weights across the manager.
         """
+        print("FROM LOCAL SGD: sync")
         self._manager.start_quorum()
         self._perform_sync()
         self._local_step = 0

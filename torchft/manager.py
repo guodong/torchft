@@ -148,6 +148,8 @@ class Manager:
                 all of the model weights are initialized identically via
                 ``torch.set_seed`` you should set this to False.
         """
+
+        print(f"FROM MANAGER.PY: INITIALIZING MANAGER")
         self._load_state_dict = load_state_dict
         self._user_state_dict = state_dict
         self._pending_state_dict: Optional[Dict[str, object]] = None
@@ -178,27 +180,30 @@ class Manager:
             max_workers=1, thread_name_prefix="async_quorum"
         )
         self._quorum_future: Optional[concurrent.futures.Future] = None
-
+        print(f"FROM MANAGER.PY: CREATING TCPSTORE")
+        print(f"STORE ADDR: {store_addr}, STORE PORT: {store_port}")
         self._store = TCPStore(
             host_name=store_addr,
             port=store_port,
             is_master=False,
             wait_for_workers=False,
         )
+        print(f"FROM MANAGER.PY: FINISHED CREATING TCPSTORE")
         self._pg = pg
         self._manager: Optional[ManagerServer] = None
 
         self._recovery_stream: Optional["torch.cuda.Stream"] = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
         )
-
+        print(f"FROM MANAGER.PY: FINISHED CREATING RECOVERY STREAM")
         if rank == 0:
             if port is None:
                 port = int(os.environ.get(MANAGER_PORT_ENV, 0))
 
             bind = f"[::]:{port}"
             lighthouse_addr = lighthouse_addr or os.environ["TORCHFT_LIGHTHOUSE"]
-
+            print(f"FROM MANAGER.PY: FINISHED CREATING LIGHTHOUSE ADDR")
+            print(f"LIGHTHOUSE ADDR: {lighthouse_addr}")
             # We need a unique identifier in the case that a worker restarts quickly and
             # replaces the previous worker with the same ID.
             new_uuid = str(uuid.uuid4())
