@@ -1,19 +1,20 @@
-from torchft import torchft
+import os
+import signal
+import threading
+from torchft.FFT.messaging.error_bus import ErrorBus
+from torchft.FFT.messaging.message import ErrorMessage, GPUErrorMessage, Message, NodeErrorMessage
+from torchft.manager import Manager
 
-class ManagerFFT(torchft.manager):
+class ManagerFFT(Manager):
     """
     ManagerFFT is a subclass of torchft.manager that adds a method to report errors.
     ManagerFFT = Manager + ErrorBus
     """
-    def __init__(self, ...):
-        super.__init__(...)
-        self.init_signal_handler()
-        self.
+    def __init__(self, *args, **kwargs):
+        super.__init__(*args, **kwargs)
+        self.fft = FFT(self)
 
-    def run_error_bus():
-        self.eb.register_callback(self.FFT.on_message)
-
-    def report_error(self, e: Exception) -> None:
+    def report_error(self, e: Exception, broadcast=False) -> None:
         """
         Report an error to the manager.
 
@@ -25,23 +26,74 @@ class ManagerFFT(torchft.manager):
         This should be called when an error occurs that leads to a corrupted
         gradient that needs to be discarded.
         """
-        super.report_error(e)
-        message = self.FFT.format_GPU_message(e, self._rank) # Could be GPU index or something else
-        self.eb.broadcast(message)
+        super().report_error(e)
+        if broadcast:
+            message = ErrorMessage(reason=str(e))
+            self.fft.eb.broadcast(message)
         
-
+    def reconfigure(self):
+        """
+        Reconfigure the process when participant changes.
+        This is called when an error occurs that leads to a corrupted replica groups
+        that needs to be discarded.
+        """
+        raise NotImplementedError("TODO: implemente")
 class FFT:
-    """
-    stateless class. Consists of pure functions. Defines a namespace of functions.
-    """
-    def format_message(e, rank):
-        # TODO: Add proto
-        # Put into Proto format, or something like that
-        # Proto vs. Dataclass vs. Tuple?
+    def __init__(self, manager: ManagerFFT):
+        """
+        Performs error handling and broadcasting.
+        It uses the ErrorBus to send error messages to all nodes in the cluster.
+        """
+        self.manager = manager
+        self.error_msg = None
+        self._interrupt_by_signal = threading.Event()
 
-    def on_message():
+        signal.signal(signal.SIGUSR1, self._signal_handler)
+
+        self.eb = ErrorBus(
+            host_name=self.manager._store.host(),
+            port=self.manager._store.port(),
+        )
+
+        self.eb.subscribe(self.on_message)
+
+    def _signal_handler(self, signum, frame):
+        if self._interrupt_by_signal.is_set():
+            return
         
-    def init_signal_handler():
+        self.abort()
+        
+    def on_message(self, message: Message):
+        """
+        This callback runs in a thread, here we notify the main thread.
+        """
+        self.error_msg = message
+        os.kill(os.getpid(), signal.SIGUSR1)
+        if not self._interrupt_by_signal.is_set():
+            self.abort()
+
+        self._interrupt_by_signal.clear()
+        
+    
+    def abort(self):
+        # Short circuit subsquent procs in current step
+        self.manager.report_error(Exception(self.error_msg))
+        self.manager._quorum_future.set_exception(InterruptedError(self.error_msg))
+        for work in self.manager._pending_work:
+            work.set_exception(InterruptedError(self.error_msg))
+
+        self.manager._pending_work.clear()
+
+        if self.should_reconfigure():
+            self.manager.reconfigure()
+
+    def should_reconfigure(self):
+        """
+        Check if the error message causes reconfigure of the running settings.
+        """
+        return isinstance(self.error_msg, GPUErrorMessage) or isinstance(self.error_msg, NodeErrorMessage)
+
+        
 
     
 
