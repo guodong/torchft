@@ -1,0 +1,11 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# Planning
+
+Whenever you are asked to do a task, you should break it down into the smallest achievable component and write your plan into `./.cursor/plan.md`. Create the file if it doesn't exist.
+
+Whenever a new task is finished, you should test it. The guideline should follow [testing.mdc](mdc:.cursor/rules/testing.mdc). 

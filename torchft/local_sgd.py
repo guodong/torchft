@@ -106,8 +106,7 @@ class LocalSGD:
         """
         This hook is registered on the optimizer and is called after the optimizer step.
         """
-        if self._local_step == 0: # Optimization: sync on the first step.
-            self.sync()
+        # TODO: There should be an optimization where 
         print("FROM LOCAL SGD: _step_post_hook")
         self._local_step += 1
         print(f"FROM LOCAL SGD: local_step: {self._local_step}, sync_every: {self._sync_every}")
@@ -121,7 +120,9 @@ class LocalSGD:
         """
         print("FROM LOCAL SGD: sync")
         self._manager.start_quorum()
+        print("FROM LOCAL SGD: start_quorum")
         self._perform_sync()
+        print
         self._local_step = 0
 
     def _perform_sync(self) -> None:
@@ -149,7 +150,6 @@ class LocalSGD:
         for work in works:
             work.wait()
         return averaged_parameters
-
 
 class DiLoCo:
     """

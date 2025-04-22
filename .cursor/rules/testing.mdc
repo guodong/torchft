@@ -1,0 +1,15 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# Testing
+
+Whenever you make a new change, you should test that change.
+
+The test should be simple, based on the unittest framework.
+
+If there are existing tests, build on top of that test file. Else, create a new one.
+
+When you run the unittests, run python -m unitest -v {test_module_path (in the form of a.b.c)}

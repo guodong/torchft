@@ -116,7 +116,7 @@ MASTER_CONDA_PATH="/srv/apps/danny/miniconda3"
 MASTER_ENV_NAME="warren/torchtitan"
 NODE2_PATH="/root/warren/torchft"
 NODE2_CONDA_PATH="/usr/local/conda"
-NODE2_ENV_NAME="localsgd"
+NODE2_ENV_NAME="localsgd-warren"
 if [ "$HOSTNAME" = "$MASTER_HOSTNAME" ]; then
     cd $MASTER_PATH
     source "${MASTER_CONDA_PATH}/etc/profile.d/conda.sh"
@@ -166,7 +166,7 @@ if [[ "$REPLICA_GROUP_ID" -eq 0 ]]; then
         echo "$CLUSTER_STORE_PID" > "$CLUSTER_STORE_PID_FILE"
         echo ">>> Global store PID: $CLUSTER_STORE_PID"
         echo ">>> Waiting a few seconds for the store to come up..."
-        sleep 5
+        sleep 0.5 
     fi
 else
     echo "start_global_store.sh: not leader — skipping KV‑store startup"
@@ -186,7 +186,7 @@ torchrun --nnodes=1 --nproc_per_node=1 \
 # Example:
 # ./run_server_localsgd.sh <cuda_devices> <replica_group_id> <cluster_group_id> [train_script] [script‑args…]
 
-# /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 0 0 /srv/apps/warren/torchft/train_localsgd-two_level.py 1 2 1000 # Replica Group 0, Cluster 0, wait for 1 second between steps, sync every 2 steps for 1000 steps
-# /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 1 1 0 /srv/apps/warren/torchft/train_localsgd-two_level.py 1 2 1000 # Replica Group 1, Cluster 0, wait for 1 second between steps, sync every 2 steps for 1000 steps
-# /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 0 1 /srv/apps/warren/torchft/train_localsgd-two_level.py 1 2 1000 # Replica Group 0, Cluster 1, wait for 1 second between steps, sync every 2 steps for 1000 steps
-# /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 1 1 /srv/apps/warren/torchft/train_localsgd-two_level.py 1 2 1000 # Replica Group 1, Cluster 1, wait for 1 second between steps, sync every 2 steps for 1000 steps
+# /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 0 0 /srv/apps/warren/torchft/train_DiLoCo-ICT.py 1 2 1000 # Replica Group 0, Cluster 0, wait for 1 second between steps, sync every 2 steps for 1000 steps
+# /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 1 1 0 /srv/apps/warren/torchft/train_DiLoCo-ICT.py 1 2 1000 # Replica Group 1, Cluster 0, wait for 1 second between steps, sync every 2 steps for 1000 steps
+# /root/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 0 1 /root/warren/torchft/train_DiLoCo-ICT.py 1 2 1000 # Replica Group 0, Cluster 1, wait for 1 second between steps, sync every 2 steps for 1000 steps
+# /root/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 1 1 /root/warren/torchft/train_DiLoCo-ICT.py 1 2 1000 # Replica Group 1, Cluster 1, wait for 1 second between steps, sync every 2 steps for 1000 steps

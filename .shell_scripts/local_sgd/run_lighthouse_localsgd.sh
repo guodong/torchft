@@ -38,7 +38,7 @@ MASTER_CONDA_PATH="/srv/apps/danny/miniconda3"
 MASTER_ENV_NAME="warren/torchtitan"
 NODE2_PATH="/root/warren/torchft"
 NODE2_CONDA_PATH="/usr/local/conda"
-NODE2_ENV_NAME="localsgd"
+NODE2_ENV_NAME="localsgd-warren"
 if [ "$HOSTNAME" = "$MASTER_HOSTNAME" ]; then
     cd $MASTER_PATH
     source "${MASTER_CONDA_PATH}/etc/profile.d/conda.sh"
@@ -70,4 +70,4 @@ fi
 # Example:
 # /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_lighthouse_localsgd.sh global 0 # Global Lighthouse: [lighthouse] 2025-04-19 09:29:20  10.0.0.3:29520
 # /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_lighthouse_localsgd.sh local 0 # For Cluster 0: [lighthouse] 2025-04-19 09:29:55  10.0.0.3:29521
-# /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_lighthouse_localsgd.sh local 1 # For Cluster 1: [lighthouse] 2025-04-19 09:30:09  10.0.0.3:29522
+# /root/warren/torchft/.shell_scripts/local_sgd/run_lighthouse_localsgd.sh local 1 # For Cluster 1: [lighthouse] 2025-04-19 09:30:09  10.0.0.3:29522

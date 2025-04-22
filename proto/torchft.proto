@@ -66,6 +66,12 @@ message LighthouseHeartbeatRequest {
 
 message LighthouseHeartbeatResponse {}
 
+// service LighthouseService {
+//     rpc Quorum (LighthouseQuorumRequest) returns (LighthouseQuorumResponse);
+//     rpc Heartbeat (LighthouseHeartbeatRequest) returns (LighthouseHeartbeatResponse);
+//     rpc TopologyMap (LighthouseTopologyMapRequest) returns (LighthouseTopologyMapResponse); \\ Potentially return this for optimization
+// }
+
 service LighthouseService {
     rpc Quorum (LighthouseQuorumRequest) returns (LighthouseQuorumResponse);
     rpc Heartbeat (LighthouseHeartbeatRequest) returns (LighthouseHeartbeatResponse);

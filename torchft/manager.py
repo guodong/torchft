@@ -42,7 +42,9 @@ from torch.distributed import ReduceOp, TCPStore
 from torchft._torchft import ManagerClient, ManagerServer
 from torchft.checkpointing import CheckpointTransport, HTTPTransport
 from torchft.futures import future_timeout
-
+from torch.distributed.distributed_c10d import (
+    BroadcastOptions,
+)
 if TYPE_CHECKING:
     from torchft.process_group import ProcessGroup
 
@@ -149,7 +151,7 @@ class Manager:
                 ``torch.set_seed`` you should set this to False.
         """
 
-        print(f"FROM MANAGER.PY: INITIALIZING MANAGER")
+        print(f"FROM MANAGER.PY: INITIALIZING MANAGER, replica_id: {replica_id}")
         self._load_state_dict = load_state_dict
         self._user_state_dict = state_dict
         self._pending_state_dict: Optional[Dict[str, object]] = None
@@ -164,8 +166,14 @@ class Manager:
         store_port = store_port or int(os.environ["MASTER_PORT"])
         self._rank: int = rank if rank is not None else int(os.environ["RANK"])
         rank = self._rank
-        world_size = world_size or int(os.environ["WORLD_SIZE"])
+        self._world_size: int = world_size or int(os.environ["WORLD_SIZE"])
         self._min_replica_size = min_replica_size
+
+        print("FROM MANAGER.PY: store_addr: ", store_addr)
+        print("FROM MANAGER.PY: store_port: ", store_port)
+        print("FROM MANAGER.PY: rank: ", rank)
+        print("FROM MANAGER.PY: world_size: ", self._world_size)
+        print("FROM MANAGER.PY: min_replica_size: ", self._min_replica_size)
 
         if checkpoint_transport is None:
             checkpoint_transport = HTTPTransport[Dict[str, T]](
@@ -259,76 +267,154 @@ class Manager:
             self._manager.shutdown()
         self._executor.shutdown(wait=wait)
 
-    def allreduce(self, tensor: torch.Tensor) -> torch.futures.Future[torch.Tensor]:
+    # ------------------------------------------------------------------ #
+    # Internal helper – unify common collective logic (error handling,
+    # quorum checks, future wrapping).  Both `allreduce` and `broadcast`
+    # are now thin wrappers around this utility.
+    # ------------------------------------------------------------------ #
+    def _run_collective(
+        self,
+        tensor: torch.Tensor,
+        work_fn: Callable[[], "torch.distributed.Work"],
+        post_fn: Optional[Callable[[torch.futures.Future], torch.Tensor]] = None,
+        timeout: Optional[timedelta] = None,
+        all_reduce: bool = True,
+    ) -> torch.futures.Future:
+        """
+        Run *work_fn* (which should launch a ProcessGroup collective) and
+        return a wrapped :class:`torch.futures.Future` that inherits the
+        Manager's timeout and error‑handling semantics.
+ 
+        Args
+        ----
+        tensor:
+            Tensor participating in the collective.  Used for default
+            return value if the Manager is in an errored state.
+        work_fn:
+            Zero‑arg function that starts the desired collective and
+            returns its ``Work`` handle.
+        post_fn:
+            Optional function applied to the future returned by
+            ``Work.get_future()`` (e.g. gradient normalization for
+            *allreduce*).  Must itself return *tensor*.
+        """
+        # Fast‑path if we're already in an errored state.
+        if self.errored():
+            fut = torch.futures.Future()
+            fut.set_result(tensor)
+            return fut
+ 
+        # Ensure the ProcessGroup and quorum are healthy.
+        self.wait_quorum()
+ 
+        # Zero the tensor on non‑participating replicas so they contribute
+        # neutral values to the reduction.
+        # Note that the normalization will still be correct because the
+        # non-participating replicas will not be counted in the denominator.
+        if not self.is_participating() and all_reduce:
+            tensor.zero_()
+ 
+        try:
+            work = work_fn()
+            fut = work.get_future()
+            if post_fn is not None:
+                fut = fut.then(post_fn)
+            # Apply timeout & swallow errors via Manager.wrap_future.
+            fut = self.wrap_future(fut=fut, default=tensor, timeout=timeout)
+            return fut
+        except Exception as e:
+            self._logger.exception(
+                f"got exception in collective -- skipping remaining: {e}"
+            )
+            self.report_error(e)
+            fut = torch.futures.Future()
+            fut.set_result(tensor)
+            return fut
+
+    def allreduce(self, tensor: torch.Tensor, timeout: Optional[timedelta] = None) -> torch.futures.Future[torch.Tensor]:
         """
         Fault tolerant allreduce the tensor and return a Future that will be completed when
         the tensor is ready.
-
+ 
         This will automatically scale the tensor by 1 / world_size.
-
+ 
         If an error occurs during the allreduce:
-
+ 
         * The Future will be completed with no error and instead tracked asynchronously.
         * After the first error, all subsequent calls will be noops and immediately return.
         * The tensor must be zeroed before being used as it may be corrupted.
-
+ 
         Args:
             tensor: the tensor to allreduce
+            timeout: the timeout for the allreduce, if None, the manager's timeout will be used
         Returns:
             a Future that will be completed with the allreduced tensor
         """
-        if self.errored():
-            fut = torch.futures.Future()  # pyre-fixme[29]: not a function
-            fut.set_result(tensor)
-            return fut
+        def work():
+            return self._pg.allreduce([tensor], ReduceOp.SUM)
+ 
+        def post(fut: torch.futures.Future[List[torch.Tensor]]) -> torch.Tensor:
+            # Propagate any exception.
+            nonlocal tensor
+            fut.value()
+            tensor /= self.num_participants()
+            return tensor
 
-        self.wait_quorum()
+        if timeout is None:
+            timeout = self._timeout
+ 
+        return self._run_collective(tensor, work, post, timeout=timeout, all_reduce=True)
 
-        if not self.is_participating():
-            tensor.zero_()
+    def broadcast_one(
+        self,
+        tensor: torch.Tensor,
+        root_rank: int = 0,
+        timeout: Optional[timedelta] = None,
+    ) -> torch.futures.Future[torch.Tensor]:
+        """
+        Fault‑tolerant broadcast of *tensor* from *root_rank* to all replicas
+        in the current process group.
+ 
+        ‑ On the sender (``root_rank``) the local tensor is transmitted.  
+        ‑ On all other ranks the same tensor object is overwritten in‑place with
+          the received data.
+ 
+        Semantics, timeout handling, and error recovery mirror
+        :py:meth:`Manager.allreduce`.
+ 
+        Args
+        ----
+        tensor:
+            Tensor to broadcast (in‑place).
+        root_rank:
+            Rank that owns the authoritative copy (default: 0).
+        async_op:
+            Whether to perform the broadcast asynchronously (default: True).
+ 
+        Returns
+        -------
+        torch.futures.Future
+            Future that resolves to *tensor* once the broadcast completes.
+        """
 
-        # TODO: increase timeout when waiting when healing
-        try:
-            # Run the allreduce async and save the work object so we can wait on
-            # it later.
-            work = self._pg.allreduce([tensor], ReduceOp.SUM)
-            fut = work.get_future()
-
-            # schedule grad normalization as a continuation
-            # on the Future
-            def callback(
-                fut: torch.futures.Future[List[torch.Tensor]],
-            ) -> torch.Tensor:
-                nonlocal tensor
-
-                # check for exceptions
-                fut.value()
-
-                tensor /= self.num_participants()
-
-                return tensor
-
-            fut = fut.then(callback)
-            fut = self.wrap_future(fut, tensor)
-            return fut
-
-        except Exception as e:
-            self._logger.exception(
-                f"got exception in all reduce -- skipping remaining: {e}"
-            )
-            self.report_error(e)
-
-            fut = torch.futures.Future()  # pyre-fixme[29]: not a function
-            fut.set_result(tensor)
-            return fut
+        def work():
+            return torch.distributed.broadcast(tensor, 
+                                                src=root_rank, 
+                                                group=self._pg)
+ 
+        return self._run_collective(tensor=tensor, 
+                                    work_fn=work, 
+                                    post_fn=None, 
+                                    timeout=timeout, 
+                                    all_reduce=False)
 
     def report_error(self, e: Exception) -> None:
         """
         Report an error to the manager.
-
+ 
         This will cause the manager to skip the current step and will be
         reconfigured on the next step.
-
+ 
         This should be called when an error occurs that leads to a corrupted
         gradient that needs to be discarded.
         """

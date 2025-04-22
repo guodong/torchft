@@ -7,6 +7,7 @@ Launch with torchrun; the script picks everything it needs from the
 environment that torchrun and your launcher already set.
 """
 import argparse
+from contextlib import nullcontext, contextmanager
 from functools import partial
 import os
 from datetime import timedelta
@@ -24,16 +25,16 @@ from torchft import (
     ProcessGroupBabyNCCL,
     ProcessGroupGloo,
 )
-from torchft.local_sgd import LocalSGD
+from torchft.local_sgd import LocalSGD_Two_Level
 
 def normalize(x: torch.Tensor, mean, std) -> torch.Tensor:
     return (x - mean) / std
 
-def load_state_dict(state_dict, optimizer):
+def load_state_dict(state_dict, m, optimizer):
     m.load_state_dict(state_dict["model"])
     optimizer.load_state_dict(state_dict["optim"])
 
-def state_dict(optimizer):
+def state_dict(m, optimizer):
     return {
         "model": m.state_dict(),
         "optim": optimizer.state_dict(),
@@ -102,9 +103,9 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100) 
     lighthouse_addr_local = os.environ["TORCHFT_LIGHTHOUSE_LOCAL"]
     lighthouse_addr_global = os.environ["TORCHFT_LIGHTHOUSE_GLOBAL"]
     store_addr_local = os.environ["MASTER_ADDR_LOCAL"]
-    store_addr_global = os.environ["MASTER_ADDR_GLOBAL"]
+    store_addr_global = os.environ["MASTER_ADDR_CLUSTER"]
     store_port_local = int(os.environ["MASTER_PORT_LOCAL"])
-    store_port_global = int(os.environ["MASTER_PORT_GLOBAL"])
+    store_port_global = int(os.environ["MASTER_PORT_CLUSTER"])
     print(f"lighthouse_addr_local: {lighthouse_addr_local}, lighthouse_addr_global: {lighthouse_addr_global}")
     print(f"store_addr_local: {store_addr_local}, store_port_local: {store_port_local}")
     print(f"store_addr_global: {store_addr_global}, store_port_global: {store_port_global}")
@@ -146,6 +147,7 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100) 
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
     pg_local = (
         ProcessGroupBabyNCCL(
             timeout=timedelta(seconds=5),
@@ -169,11 +171,31 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100) 
     print(f"inner_optimizer: {inner_optimizer}")
     print(f"outer_optimizer: {outer_optimizer}")
 
+    local_load_state_dict = partial(load_state_dict, m=m, optimizer=inner_optimizer)
+    global_load_state_dict = partial(load_state_dict, m=m, optimizer=outer_optimizer)
+
+    local_state_dict = partial(state_dict, m=m, optimizer=inner_optimizer)
+    global_state_dict = partial(state_dict, m=m, optimizer=outer_optimizer)
+
+    print(f"pg_global: {pg_global}")
+    print(f"MIN_SIZE_GLOBAL: {MIN_SIZE_GLOBAL}")
+    print("global_load_state_dict: ", global_load_state_dict)
+    print("global_state_dict: ", global_state_dict)
+    print("local_load_state_dict: ", local_load_state_dict)
+    print("local_state_dict: ", local_state_dict)
+    print(f"replica_id: {f'train_localsgd_{CLUSTER_GROUP_ID}'}")
+    print(f"timeout: {timedelta(seconds=10)}")
+    print(f"lighthouse_addr: {lighthouse_addr_global}")
+    print(f"store_addr: {store_addr_global}")
+    print(f"store_port: {store_port_global}")
+    print(f"rank: {rank_global}")
+    print(f"world_size: {world_size_cluster}")
+
     manager_local = Manager(
         pg=pg_local,
         min_replica_size=MIN_SIZE_LOCAL,
-        load_state_dict=partial(load_state_dict, optimizer=inner_optimizer),
-        state_dict=partial(state_dict, optimizer=inner_optimizer),
+        load_state_dict=local_load_state_dict,
+        state_dict=local_state_dict,
         replica_id=f"train_localsgd_{CLUSTER_GROUP_ID}_{REPLICA_GROUP_ID}", #TODO: Do we need to have the cluster group id here?
         timeout=timedelta(seconds=10),
         # Different varaibles for global and local managers.
@@ -184,28 +206,15 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100) 
         world_size=world_size_replica_group,
     )
 
-    print(f"manager_local: {manager_local}")
-
-    print(f"pg_global: {pg_global}")
-    print(f"MIN_SIZE_GLOBAL: {MIN_SIZE_GLOBAL}")
-    print(f"load_state_dict: {partial(load_state_dict, optimizer=outer_optimizer)}")
-    print(f"state_dict: {partial(state_dict, optimizer=outer_optimizer)}")
-    print(f"replica_id: {f'train_localsgd_{CLUSTER_GROUP_ID}'}")
-    print(f"timeout: {timedelta(seconds=10)}")
-    print(f"lighthouse_addr: {lighthouse_addr_global}")
-    print(f"store_addr: {store_addr_global}")
-    print(f"store_port: {store_port_global}")
-    print(f"rank: {rank_global}")
-    print(f"world_size: {world_size_cluster}")
     
     manager_global = Manager(
         pg=pg_global,
         min_replica_size=MIN_SIZE_GLOBAL,
-        load_state_dict=partial(load_state_dict, optimizer=outer_optimizer),
-        state_dict=partial(state_dict, optimizer=outer_optimizer),
+        load_state_dict=global_load_state_dict,
+        state_dict=global_state_dict,
         replica_id=f"train_localsgd_{CLUSTER_GROUP_ID}",
         timeout=timedelta(seconds=10),
-        # Different varaibles for global and local managers.
+        # Different variables for global and local managers.
         lighthouse_addr=lighthouse_addr_global,
         store_addr=store_addr_global,
         store_port=store_port_global,
@@ -218,23 +227,33 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100) 
     managed_inner_optimizer = Optimizer(manager=manager_local, optim=inner_optimizer) # TODO: Move to DiLoCo, where the global and local optimizers are different
     criterion = nn.CrossEntropyLoss()
 
-    with LocalSGD(manager_global, m, optimizer=outer_optimizer, sync_every=sync_every):
-    # with DiLoCo(manager_global, m, inner_optimizer=managed_inner_optimizer, outer_optimizer=outer_optimizer, sync_every=sync_every):
-        while True:
-            for x, y in trainloader:
-                x = x.to(device)
-                y = y.to(device)
-                managed_inner_optimizer.zero_grad()
-                output = m(x)
-                loss = criterion(output, y)
-                loss.backward()
-                managed_inner_optimizer.step()
+    local_sgd_ctx = LocalSGD_Two_Level(manager=manager_global, #TODO: Rename these to be more descriptive. But currently want to keep in line with torchFT
+                           cluster_manager=manager_local, 
+                           model=m, 
+                           optimizer=inner_optimizer, 
+                           sync_every=sync_every, 
+                           self_rank=REPLICA_GROUP_ID, 
+                           root_rank=0)
 
-                if manager_global.current_step() >= steps_to_run:
-                    # complete training
-                    exit()
+    with local_sgd_ctx:
+        # If REPLICA_GROUP_ID == 0, then sync with the global manager.
+        # After syncing with the global manager, needs to broadcast the model parameters to the other local replica groups.
+        for x, y in trainloader:
+            print(f"manager_global.current_step(): {manager_global.current_step()}")
+            print(f"manager_local.current_step(): {manager_local.current_step()}")
+            x = x.to(device)
+            y = y.to(device)
+            managed_inner_optimizer.zero_grad()
+            output = m(x)
+            loss = criterion(output, y)
+            loss.backward()
+            managed_inner_optimizer.step()
 
-                sleep(sleep_time)
+            if manager_global.current_step() >= steps_to_run:
+                # complete training
+                exit()
+
+            sleep(sleep_time)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

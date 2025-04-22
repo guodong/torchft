@@ -299,6 +299,8 @@ impl ManagerService for Arc<Manager> {
 
         let req = request.into_inner();
 
+        println!("checkpoint_metadata: {:?}", state.checkpoint_metadata);
+
         let metadata = state
             .checkpoint_metadata
             .get(&req.rank)

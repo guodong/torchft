@@ -1,0 +1,12 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+
+# Conda Setup
+
+Before you run anything command in the terminal, first do 
+conda init bash
+source /srv/apps/danny/miniconda3/etc/profile.d/conda.sh
+conda activate /srv/apps/danny/miniconda3/envs/localsgd
