@@ -11,7 +11,9 @@
 #   [script‑args…]  – forwarded verbatim to the training script
 #
 # Edit the topology section to match your machines/IPs.
+
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 
 # User Input
 CUDA_DEVICES=${1:-0} # CUDA devices 
@@ -32,6 +34,7 @@ export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
 ########################  Topology description  ##########################
 NUM_REPLICA_GROUPS_LOCAL_CLUSTER=3                # DP groups *inside* each cluster
 NUM_CLUSTERS=2                      # physical clusters
+GLOBAL_REPLICA_ID=$((CLUSTER_GROUP_ID * NUM_REPLICA_GROUPS_LOCAL_CLUSTER + REPLICA_GROUP_ID))
 
 MASTER_HOSTNAME="sz-k8s-master"
 MASTER_IP="10.0.0.3"
@@ -42,10 +45,11 @@ NODE2_IP="10.0.0.2"
 NODE2_NET_IF="ens81f1"
 
 GLOBAL_LIGHTHOUSE_PORT=29520        # one per experiment (master)
-LOCAL_LIGHTHOUSE_PORT=$((29521 + CLUSTER_GROUP_ID))    # one per cluster
+LOCAL_LIGHTHOUSE_PORT=$((GLOBAL_LIGHTHOUSE_PORT + 1 + CLUSTER_GROUP_ID))    # one per cluster
 
-GLOBAL_STORE_PORT=29499             # kv‑store for the global Manager
-LOCAL_STORE_PORT_BASE=29400         # kv‑store for the local  Manager (+gpu‑idx)
+base_store_port=29499
+CLUSTER_STORE_PORT=$((base_store_port + CLUSTER_GROUP_ID))             # kv‑store for the global Manager
+REPLICA_GROUP_STORE_PORT_BASE=$((base_store_port + NUM_CLUSTERS + 1 + GLOBAL_REPLICA_ID))         # kv‑store for the local  Manager (+gpu‑idx)
 ##########################################################################
 
 # Detect and configure based on hostname
@@ -77,9 +81,9 @@ export TORCHFT_LIGHTHOUSE_LOCAL="http://${HOST_IP}:${LOCAL_LIGHTHOUSE_PORT}"
 export TORCHFT_LIGHTHOUSE_GLOBAL="http://${MASTER_IP}:${GLOBAL_LIGHTHOUSE_PORT}"
 
 export MASTER_ADDR_LOCAL="$HOST_IP"
-export MASTER_PORT_LOCAL=$((LOCAL_STORE_PORT_BASE + REPLICA_GROUP_ID))
-export MASTER_ADDR_GLOBAL="$MASTER_IP"
-export MASTER_PORT_GLOBAL=$GLOBAL_STORE_PORT
+export MASTER_PORT_LOCAL=$((REPLICA_GROUP_STORE_PORT_BASE + CLUSTER_GROUP_ID * NUM_REPLICA_GROUPS_LOCAL_CLUSTER + REPLICA_GROUP_ID)) # The local store port has to be unique for each replica group
+export MASTER_ADDR_CLUSTER="$MASTER_IP"
+export MASTER_PORT_CLUSTER=$CLUSTER_STORE_PORT
 # ────────────────────────────────────────────────────────────────────────
 
 # NCCL + CUDA housekeeping
@@ -98,8 +102,8 @@ echo "         TORCHFT_LIGHTHOUSE_LOCAL: $TORCHFT_LIGHTHOUSE_LOCAL"
 echo "         TORCHFT_LIGHTHOUSE_GLOBAL: $TORCHFT_LIGHTHOUSE_GLOBAL"
 echo "         MASTER_ADDR_LOCAL: $MASTER_ADDR_LOCAL"
 echo "         MASTER_PORT_LOCAL: $MASTER_PORT_LOCAL"
-echo "         MASTER_ADDR_GLOBAL: $MASTER_ADDR_GLOBAL"
-echo "         MASTER_PORT_GLOBAL: $MASTER_PORT_GLOBAL"
+echo "         MASTER_ADDR_CLUSTER: $MASTER_ADDR_CLUSTER"
+echo "         MASTER_PORT_CLUSTER: $MASTER_PORT_CLUSTER"
 echo "         CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 echo "         NCCL_IF: $NCCL_IF"
 echo "         NCCL_DEBUG: $NCCL_DEBUG"
@@ -127,55 +131,47 @@ elif [ "$HOSTNAME" = "$NODE2_HOSTNAME" ]; then
     . "$HOME/.cargo/env"
 fi
 
-
-
-# --- Start Global TCPStore (only on designated lead process) ---
-# We designate Cluster 0, Replica 0 running on the MASTER_HOSTNAME as the leader
-# responsible for hosting the *global* store.
-if [[ "$HOSTNAME" == "$MASTER_HOSTNAME" && "$CLUSTER_GROUP_ID" -eq 0 && "$REPLICA_GROUP_ID" -eq 0 ]]; then
-    # --- Location of the KV store script ---
+if [[ "$REPLICA_GROUP_ID" -eq 0 ]]; then
+    echo ">>> This is Replica 0 in the Cluster (Cluster $CLUSTER_GROUP_ID)"
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
-    KV_STORE_SCRIPT="${SCRIPT_DIR}/start_kv_store.py" # Assuming it's in the same dir
+    KV_STORE_SCRIPT="${SCRIPT_DIR}/start_kv_store.py"   # adjust if you relocate the .py
 
-    # --- Process Management for background store ---
-    PID_DIR="/tmp"
-    GLOBAL_STORE_PID_FILE="${PID_DIR}/torchft_global_store.pid"
-    GLOBAL_STORE_LOG_FILE="${PID_DIR}/torchft_global_store.log"
-
-    echo ">>> This is the lead process (Cluster 0, Replica 0 on $MASTER_HOSTNAME)."
-
-    # Check if script exists
-    if [[ ! -f "$KV_STORE_SCRIPT" ]]; then
-        echo "ERROR: KV store script not found at $KV_STORE_SCRIPT"; exit 1;
-    fi
-
-
-    # Check if already running via PID file
-    if [[ -f "$GLOBAL_STORE_PID_FILE" ]] && ps -p "$(cat "$GLOBAL_STORE_PID_FILE")" > /dev/null; then
-        echo ">>> Global store appears to be running (PID $(cat "$GLOBAL_STORE_PID_FILE")). Skipping start."
+    PID_DIR=/tmp
+    CLUSTER_STORE_PID_FILE="${PID_DIR}/torchft_global_store_${CLUSTER_GROUP_ID}.pid"
+    CLUSTER_STORE_LOG_FILE="${PID_DIR}/torchft_global_store_${CLUSTER_GROUP_ID}.log"
+    echo ">>> CLUSTER_STORE_PID_FILE: $CLUSTER_STORE_PID_FILE"
+    echo ">>> CLUSTER_STORE_LOG_FILE: $CLUSTER_STORE_LOG_FILE"
+    if [[ -f "$CLUSTER_STORE_PID_FILE" ]] && ps -p "$(cat "$CLUSTER_STORE_PID_FILE")" > /dev/null 2>&1; then
+        echo ">>> Global store already running (PID $(cat "$CLUSTER_STORE_PID_FILE")). Skipping KV‑store startup."
     else
-         if [[ -f "$GLOBAL_STORE_PID_FILE" ]]; then
-             echo ">>> Removing stale PID file $GLOBAL_STORE_PID_FILE"
-             rm -f "$GLOBAL_STORE_PID_FILE"
-         fi
+        # Clean stale PID file
+        if [[ -f "$CLUSTER_STORE_PID_FILE" ]]; then
+            echo ">>> Removing stale PID file $CLUSTER_STORE_PID_FILE"
+            rm -f "$CLUSTER_STORE_PID_FILE"
+        fi
 
-        echo ">>> Starting GLOBAL KVStore via ${KV_STORE_SCRIPT} in the background..."
-        echo ">>> Store Address: ${MASTER_ADDR_GLOBAL}:${MASTER_PORT_GLOBAL}"
-        echo ">>> Log File:      ${GLOBAL_STORE_LOG_FILE}"
-        echo ">>> PID File:      ${GLOBAL_STORE_PID_FILE}"
+        echo ">>> Starting GLOBAL KVStore in background..."
+        echo ">>> Store address: ${MASTER_ADDR_CLUSTER}:${MASTER_PORT_CLUSTER}"
+        echo ">>> Log file:      ${CLUSTER_STORE_LOG_FILE}"
+        echo ">>> PID file:      ${CLUSTER_STORE_PID_FILE}"
 
         nohup python -u "$KV_STORE_SCRIPT" \
-            --host "$MASTER_ADDR_GLOBAL" \
-            --port "$MASTER_PORT_GLOBAL" \
-            --timeout 3600 \
-            --pid-file "$GLOBAL_STORE_PID_FILE" \
-            > "$GLOBAL_STORE_LOG_FILE" 2>&1 & # Run in background
-            
-        GLOBAL_STORE_PID=$!
-        echo ">>> Global store background process PID: $GLOBAL_STORE_PID"
-        echo ">>> Waiting a few seconds for global store to initialize..."
-        sleep 5 # Give the store time to start listening
+              --host    "$MASTER_ADDR_CLUSTER" \
+              --port    "$MASTER_PORT_CLUSTER" \
+              --timeout 3600 \
+              --pid-file "$CLUSTER_STORE_PID_FILE" \
+              > "$CLUSTER_STORE_LOG_FILE" 2>&1 &
+
+        CLUSTER_STORE_PID=$!
+        echo "$CLUSTER_STORE_PID" > "$CLUSTER_STORE_PID_FILE"
+        echo ">>> Global store PID: $CLUSTER_STORE_PID"
+        echo ">>> Waiting a few seconds for the store to come up..."
+        sleep 5
     fi
+else
+    echo "start_global_store.sh: not leader — skipping KV‑store startup"
+    echo "  HOSTNAME=$HOSTNAME   MASTER_HOSTNAME=$MASTER_HOSTNAME"
+    echo "  CLUSTER_GROUP_ID=$CLUSTER_GROUP_ID   REPLICA_GROUP_ID=$REPLICA_GROUP_ID"
 fi
 
 # ------------------------------------------------------------------
@@ -191,12 +187,6 @@ torchrun --nnodes=1 --nproc_per_node=1 \
 # ./run_server_localsgd.sh <cuda_devices> <replica_group_id> <cluster_group_id> [train_script] [script‑args…]
 
 # /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 0 0 /srv/apps/warren/torchft/train_localsgd-two_level.py 1 2 1000 # Replica Group 0, Cluster 0, wait for 1 second between steps, sync every 2 steps for 1000 steps
-# /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 1 0 /srv/apps/warren/torchft/train_localsgd-two_level.py 1 2 1000 # Replica Group 1, Cluster 0, wait for 1 second between steps, sync every 2 steps for 1000 steps
+# /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 1 1 0 /srv/apps/warren/torchft/train_localsgd-two_level.py 1 2 1000 # Replica Group 1, Cluster 0, wait for 1 second between steps, sync every 2 steps for 1000 steps
 # /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 0 1 /srv/apps/warren/torchft/train_localsgd-two_level.py 1 2 1000 # Replica Group 0, Cluster 1, wait for 1 second between steps, sync every 2 steps for 1000 steps
 # /srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 1 1 /srv/apps/warren/torchft/train_localsgd-two_level.py 1 2 1000 # Replica Group 1, Cluster 1, wait for 1 second between steps, sync every 2 steps for 1000 steps
-
-# TODO:  
-# 1. Support elasticity with the data sampler. GLOBAL_REPLICA_NUM is not known ahead of time.
-# 2. Set CLUSTER_GROUP_ID in the run_server.sh script
-# 3. The global rank is hard to set/define. The current reliance on rank is restrictive. Makes the programming model fully grid like.
-# 4. Cluster world size should be auto-configurable.

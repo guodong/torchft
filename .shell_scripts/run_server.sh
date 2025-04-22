@@ -11,7 +11,7 @@ export NCCL_DEBUG_SUBSYS=ALL"
 CUDA_DEVICES=${1:-0}
 NNODES=1
 NPROC_PER_NODE=1
-TRAIN_SCRIPT=${2:-"train_test.py"}
+TRAIN_SCRIPT=${2:-"/srv/apps/warren/torchft/train_ddp.py"}
 # Everything after the second CLI argument is forwarded verbatim to the training script
 TRAIN_ARGS="${@:3}"
 

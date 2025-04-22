@@ -1,31 +1,74 @@
-# This script is set up for running localsgd on shenzhen-node2 and shenzhen-nodem
+#!/bin/bash
 
-I set up my environment according to the TorchTitan README and TorchFT README.
+# Usage:
+# ./run_server_localsgd.sh <cuda_devices> <replica_group_id> <cluster_group_id> [train_script] [script-args...]
 
-To run, first start the lighthouse on shenzhen-nodem (node 2 is not confirmed to work): 
-```bash
-/srv/apps/warren/torchft/.shell_scripts/run_lighthouse.sh
+set -e
 
-Then,
-```bash
-On node-m:source /srv/apps/warren/torchft/.shell_scripts/run_lighthouse.sh
-On node-2:source /root/warren/torchft/.shell_scripts/run_server.sh
-```bash
+CUDA_VISIBLE_DEVICES=$1
+REPLICA_GROUP_ID=$2
+CLUSTER_GROUP_ID=$3
+shift 3
+TRAIN_SCRIPT=$1
+shift 1
 
-```bash
-# TorchTitan setup
-git clone https://github.com/pytorch/torchtitan
-cd torchtitan
-pip install -r requirements.txt
-pip3 install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126 --force-reinstall
-python scripts/download_tokenizer.py --repo_id meta-llama/Meta-Llama-3.1-8B --tokenizer_path "original" --hf_token=...
+export CUDA_VISIBLE_DEVICES
 
-# TorchFT setup
-curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSf | sh
+# Configuration variables (these would normally be set or sourced from a config)
+NUM_CLUSTERS=2
+NUM_REPLICA_GROUPS_LOCAL_CLUSTER=2
 
-# Installation from github because don't have sudo
-wget https://github.com/protocolbuffers/protobuf/releases/download/v30.2/protoc-30.2-linux-x86_64.zip
-unzip protoc-30.2-linux-x86_64.zip -d $HOME/.local
-export PATH=$HOME/.local/bin:$PATH
-pip install .
-```
+MASTER_ADDR_CLUSTER="10.0.0.3"
+MASTER_PORT_CLUSTER=29499
+
+MASTER_ADDR_LOCAL="localhost"  # Overwritten by torchrun normally
+MASTER_PORT_LOCAL=29522        # Overwritten by torchrun normally
+
+TORCHFT_LIGHTHOUSE_GLOBAL="http://10.0.0.3:29520"
+TORCHFT_LIGHTHOUSE_LOCAL="http://10.0.0.3:29522"
+
+WORLD_SIZE_CLUSTER=1
+WORLD_SIZE_REPLICA_GROUP=2
+
+LOCAL_RANK=0
+GLOBAL_REPLICA_NUM=$((NUM_CLUSTERS * NUM_REPLICA_GROUPS_LOCAL_CLUSTER))
+GLOBAL_REPLICA_ID=$((CLUSTER_GROUP_ID * NUM_REPLICA_GROUPS_LOCAL_CLUSTER + REPLICA_GROUP_ID))
+
+KV_STORE_SCRIPT="/srv/apps/warren/torchft/kv_store.py"
+
+CLUSTER_STORE_PID_FILE="/tmp/cluster_store_${CLUSTER_GROUP_ID}.pid"
+CLUSTER_STORE_LOG_FILE="/tmp/cluster_store_${CLUSTER_GROUP_ID}.log"
+
+echo "Starting server with CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}, REPLICA_GROUP_ID=${REPLICA_GROUP_ID}, CLUSTER_GROUP_ID=${CLUSTER_GROUP_ID}"
+
+if [[ -f "$CLUSTER_STORE_PID_FILE" ]] && ps -p "$(cat "$CLUSTER_STORE_PID_FILE")" > /dev/null 2>&1; then
+    echo ">>> Global store already running (PID $(cat "$CLUSTER_STORE_PID_FILE")). Skipping KV‑store startup."
+else
+    # Clean stale PID file
+    if [[ -f "$CLUSTER_STORE_PID_FILE" ]]; then
+        echo ">>> Removing stale PID file $CLUSTER_STORE_PID_FILE"
+        rm -f "$CLUSTER_STORE_PID_FILE"
+    fi
+
+    echo ">>> Starting GLOBAL KVStore in background..."
+    echo ">>> Store address: ${MASTER_ADDR_CLUSTER}:${MASTER_PORT_CLUSTER}"
+    echo ">>> Log file:      ${CLUSTER_STORE_LOG_FILE}"
+    echo ">>> PID file:      ${CLUSTER_STORE_PID_FILE}"
+
+    nohup python -u "$KV_STORE_SCRIPT" \
+          --host    "$MASTER_ADDR_CLUSTER" \
+          --port    "$MASTER_PORT_CLUSTER" \
+          --timeout 3600 \
+          --pid-file "$CLUSTER_STORE_PID_FILE" \
+          > "$CLUSTER_STORE_LOG_FILE" 2>&1 &
+
+    CLUSTER_STORE_PID=$!
+    echo "$CLUSTER_STORE_PID" > "$CLUSTER_STORE_PID_FILE"
+    echo ">>> Global store PID: $CLUSTER_STORE_PID"
+    echo ">>> Waiting a few seconds for the store to come up..."
+    sleep 5
+fi
+
+# Start training script
+echo ">>> Launching training script: $TRAIN_SCRIPT $@"
+python "$TRAIN_SCRIPT" "$@"
