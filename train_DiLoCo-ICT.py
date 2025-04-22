@@ -11,7 +11,9 @@ from functools import partial
 import os
 from datetime import timedelta
 from time import sleep
-from typing import Dict
+from typing import Dict, Optional
+
+from urllib3 import PoolManager
 from torch.distributed.elastic.multiprocessing.errors import record
 from torchdata.stateful_dataloader import StatefulDataLoader
 import torch
@@ -67,8 +69,13 @@ class Net(nn.Module):
         return x
 
 @record
-def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100) -> None:
-    print(f"sleep_time: {sleep_time}, sync_every: {sync_every}, steps_to_run: {steps_to_run}")
+def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100, debug: bool = True) -> None:
+    def debug_print(*args, **kwargs) -> None:
+        if debug:
+            print("[FROM MAIN:] ", *args, **kwargs)
+        return
+    
+    debug_print(f"sleep_time: {sleep_time}, sync_every: {sync_every}, steps_to_run: {steps_to_run}")
     MIN_SIZE_GLOBAL = 1
     MIN_SIZE_LOCAL = 1
     # Local cluster group ID and number
@@ -76,14 +83,15 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100) 
     NUM_CLUSTERS = int(os.environ.get("NUM_CLUSTERS", 2)) # number of physical clusters
     # Local replica group ID and number within the inner cluster
     REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0)) # ID of the inner replica group
+    leader = (REPLICA_GROUP_ID == 0)
     NUM_REPLICA_GROUPS_LOCAL_CLUSTER = int(os.environ.get("NUM_REPLICA_GROUPS_LOCAL_CLUSTER", 2)) # DP groups *inside* each cluster
     # Local rank within the inner replica group
     RANK = int(os.environ.get("RANK")) # This is set by torchrun, it is the rank within the inner replica group of the current process
     # Global replica ID and number
     GLOBAL_REPLICA_ID = CLUSTER_GROUP_ID * NUM_REPLICA_GROUPS_LOCAL_CLUSTER + REPLICA_GROUP_ID # Global replica ID
     GLOBAL_REPLICA_NUM = NUM_REPLICA_GROUPS_LOCAL_CLUSTER * NUM_CLUSTERS # Total number of outer replicas
-    print(
-        f"[Config] RANK={RANK}, CLUSTER_GROUP_ID={CLUSTER_GROUP_ID}, "
+    debug_print(
+        f"[Config] INNER_RANK={RANK}, CLUSTER_GROUP_ID={CLUSTER_GROUP_ID}, "
         f"REPLICA_GROUP_ID={REPLICA_GROUP_ID}, "
         f"NUM_CLUSTERS={NUM_CLUSTERS}, NUM_REPLICA_GROUPS_LOCAL_CLUSTER={NUM_REPLICA_GROUPS_LOCAL_CLUSTER}, "
         f"GLOBAL_REPLICA_NUM={GLOBAL_REPLICA_NUM}, "
@@ -96,16 +104,16 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100) 
     store_addr_outer = os.environ["MASTER_ADDR_CLUSTER"]
     store_port_inner = int(os.environ["MASTER_PORT_LOCAL"])
     store_port_outer = int(os.environ["MASTER_PORT_CLUSTER"])
-    print(f"lighthouse_addr_inner: {lighthouse_addr_inner}, lighthouse_addr_outer: {lighthouse_addr_outer}")
-    print(f"store_addr_inner: {store_addr_inner}, store_port_inner: {store_port_inner}")
-    print(f"store_addr_outer: {store_addr_outer}, store_port_outer: {store_port_outer}")
+    debug_print(f"lighthouse_addr_inner: {lighthouse_addr_inner}, lighthouse_addr_outer: {lighthouse_addr_outer}")
+    debug_print(f"store_addr_inner: {store_addr_inner}, store_port_inner: {store_port_inner}")
+    debug_print(f"store_addr_outer: {store_addr_outer}, store_port_outer: {store_port_outer}")
     
     rank_inner = RANK
     outer_manager_rank = REPLICA_GROUP_ID # This is the rank of the outer manager.
     world_size_replica_group = int(os.environ["WORLD_SIZE"]) # Number of gpus in the replica group. Handled by torchrun
     world_size_cluster = 1 # This is always 1, because at the cluster level we are only doing DDP (for now)
 
-    print(f"world_size_replica_group: {world_size_replica_group}, world_size_cluster: {world_size_cluster}")
+    debug_print(f"world_size_replica_group: {world_size_replica_group}, world_size_cluster: {world_size_cluster}")
 
     mean = torch.tensor((0.5, 0.5, 0.5)).view(3, 1, 1)
     std = torch.tensor((0.5, 0.5, 0.5)).view(3, 1, 1)
@@ -156,28 +164,9 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100) 
         m.parameters(), lr=0.7, momentum=0.9, nesterov=True
     )
 
-    print(f"m: {m}")
-    print(f"inner_optimizer: {inner_optimizer}")
-    print(f"outer_optimizer: {outer_optimizer}")
-
-    def outer_load_state_dict(state_dict: Dict[str, Dict[str, object]]) -> None:
-        m.load_state_dict(state_dict["model"])
-        m.to(device)
-        diloco.original_parameters = state_dict["original_params"]
-        for name in diloco.original_parameters.keys():
-            diloco.original_parameters[name] = diloco.original_parameters[name].to(
-                device
-            )
-        inner_optimizer.load_state_dict(state_dict["inner_optim"])
-        outer_optimizer.load_state_dict(state_dict["outer_optim"])
-        
-    def outer_state_dict() -> Dict[str, Dict[str, object]]:  # pyre-ignore[53]
-        return {
-            "model": m.state_dict(),
-            "original_params": diloco.original_parameters,
-            "inner_optim": inner_optimizer.state_dict(),
-            "outer_optim": outer_optimizer.state_dict(),
-        }
+    debug_print(f"m: {m}")
+    debug_print(f"inner_optimizer: {inner_optimizer}")
+    debug_print(f"outer_optimizer: {outer_optimizer}")
 
     def inner_load_state_dict(state_dict: Dict[str, Dict[str, object]]) -> None:
         m.load_state_dict(state_dict["model"])
@@ -190,58 +179,82 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100) 
         }
 
 
-    print(f"pg_outer: {pg_outer}")
-    print(f"MIN_SIZE_GLOBAL: {MIN_SIZE_GLOBAL}")
-    print("outer_load_state_dict: ", outer_load_state_dict)
-    print("inner_load_state_dict: ", inner_load_state_dict)
-    print(f"replica_id: {f'train_outermanager_{CLUSTER_GROUP_ID}'}")
-    print(f"timeout: {timedelta(seconds=10)}")
-    print(f"lighthouse_addr: {lighthouse_addr_outer}")
-    print(f"store_addr: {store_addr_outer}")
-    print(f"store_port: {store_port_outer}")
-    print(f"rank: {outer_manager_rank}")
-    print(f"world_size_cluster: {world_size_cluster}")
+    debug_print(f"pg_outer: {pg_outer}")
+    debug_print(f"MIN_SIZE_GLOBAL: {MIN_SIZE_GLOBAL}")
+    debug_print("inner_load_state_dict: ", inner_load_state_dict)
+    debug_print(f"replica_id: {f'train_outermanager_{CLUSTER_GROUP_ID}'}")
+    debug_print(f"timeout: {timedelta(seconds=10)}")
+    debug_print(f"lighthouse_addr: {lighthouse_addr_outer}")
+    debug_print(f"store_addr: {store_addr_outer}")
+    debug_print(f"store_port: {store_port_outer}")
+    debug_print(f"rank: {outer_manager_rank}")
+    debug_print(f"world_size_cluster: {world_size_cluster}")
 
-    # inner_manager = Manager(
-    #     pg=pg_inner,
-    #     min_replica_size=MIN_SIZE_LOCAL,
-    #     load_state_dict=inner_load_state_dict,
-    #     state_dict=inner_state_dict,
-    #     replica_id=f"train_outermanager_{CLUSTER_GROUP_ID}_{REPLICA_GROUP_ID}", #TODO: Do we need to have the cluster group id here?
-    #     timeout=timedelta(seconds=10),
-    #     # Different varaibles for outer and inner managers.
-    #     lighthouse_addr=lighthouse_addr_inner,
-    #     store_addr=store_addr_inner,
-    #     store_port=store_port_inner,
-    #     rank=rank_inner,
-    #     world_size=world_size_replica_group,
-    # )
-
-    
-    outer_manager = Manager(
-        pg=pg_outer,
-        min_replica_size=MIN_SIZE_GLOBAL,
-        load_state_dict=outer_load_state_dict,
-        state_dict=outer_state_dict,
-        replica_id=f"train_outermanager_{CLUSTER_GROUP_ID}",
+    inner_manager = Manager(
+        pg=pg_inner,
+        min_replica_size=MIN_SIZE_LOCAL,
+        load_state_dict=inner_load_state_dict,
+        state_dict=inner_state_dict,
+        replica_id=f"train_outermanager_{CLUSTER_GROUP_ID}_{REPLICA_GROUP_ID}", #TODO: Do we need to have the cluster group id here?
         timeout=timedelta(seconds=10),
-        # Different variables for outer and inner managers.
-        lighthouse_addr=lighthouse_addr_outer,
-        store_addr=store_addr_outer,
-        store_port=store_port_outer,
-        rank=outer_manager_rank,
-        world_size=world_size_cluster,
+        # Different varaibles for outer and inner managers.
+        lighthouse_addr=lighthouse_addr_inner,
+        store_addr=store_addr_inner,
+        store_port=store_port_inner,
+        rank=rank_inner,
+        world_size=world_size_replica_group,
     )
 
-    print(f"outer_manager: {outer_manager}")
+    outer_manager: Optional[Manager] = None
 
-    # managed_inner_optimizer = Optimizer(manager=inner_manager, optim=inner_optimizer)
-    managed_outer_optimizer = Optimizer(manager=outer_manager, optim=outer_optimizer)
+    if leader:
+        # Define the outer manager, only needed by the leader
+        def outer_load_state_dict(state_dict: Dict[str, Dict[str, object]]) -> None:
+            m.load_state_dict(state_dict["model"])
+            m.to(device)
+            diloco.original_parameters = state_dict["original_params"]
+            for name in diloco.original_parameters.keys():
+                diloco.original_parameters[name] = diloco.original_parameters[name].to(
+                    device
+                )
+            inner_optimizer.load_state_dict(state_dict["inner_optim"])
+            outer_optimizer.load_state_dict(state_dict["outer_optim"])
+            
+        def outer_state_dict() -> Dict[str, Dict[str, object]]:  # pyre-ignore[53]
+            return {
+                "model": m.state_dict(),
+                "original_params": diloco.original_parameters,
+                "inner_optim": inner_optimizer.state_dict(),
+                "outer_optim": outer_optimizer.state_dict(),
+            }
+        outer_manager = Manager(
+            pg=pg_outer,
+            min_replica_size=MIN_SIZE_GLOBAL,
+            load_state_dict=outer_load_state_dict,
+            state_dict=outer_state_dict,
+            replica_id=f"train_outermanager_{CLUSTER_GROUP_ID}",
+            timeout=timedelta(seconds=10),
+
+            # Different variables for outer and inner managers.
+            lighthouse_addr=lighthouse_addr_outer,
+            store_addr=store_addr_outer,
+            store_port=store_port_outer,
+            rank=outer_manager_rank,
+            world_size=world_size_cluster,
+        )
+
+        debug_print("outer_load_state_dict: ", outer_load_state_dict)
+        debug_print("outer_state_dict: ", outer_state_dict)
+        debug_print(f"outer_manager: {outer_manager}")
+        outer_manager._use_async_quorum = False
+
+    managed_inner_optimizer = Optimizer(manager=inner_manager, optim=inner_optimizer)
     criterion = nn.CrossEntropyLoss()
 
-    outer_manager._use_async_quorum = False
+    current_step = 0
     with DiLoCo_ICT(
         outer_manager=outer_manager,
+        inner_manager=inner_manager,
         model=m,
         inner_optimizer=inner_optimizer,
         outer_optimizer=outer_optimizer,
@@ -252,17 +265,19 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100) 
         # If REPLICA_GROUP_ID == 0, then sync with the outer manager.
         # After syncing with the outer manager, needs to broadcast the model parameters to the other inner replica groups.
         for x, y in trainloader:
-            print(f"outer_manager.current_step(): {outer_manager.current_step()}")
-            # print(f"inner_manager.current_step(): {inner_manager.current_step()}")
+            current_step += 1
+            if outer_manager is not None:
+                debug_print(f"outer_manager.current_step(): {outer_manager.current_step()}")
+            # debug_print(f"inner_manager.current_step(): {inner_manager.current_step()}")
             x = x.to(device)
             y = y.to(device)
             output = m(x)
             loss = criterion(output, y)
-            inner_optimizer.zero_grad() #TODO: Make this managed_inner_optimizer.zero_grad()
+            managed_inner_optimizer.zero_grad() #TODO: Make this managed_inner_optimizer.zero_grad()
             loss.backward()
-            inner_optimizer.step() #TODO: Make this managed_inner_optimizer.step()
+            managed_inner_optimizer.step() #TODO: Make this managed_inner_optimizer.step()
 
-            if outer_manager.current_step() >= steps_to_run:
+            if current_step >= steps_to_run:
                 # complete training
                 exit()
 

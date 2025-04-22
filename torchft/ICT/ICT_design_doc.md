@@ -454,6 +454,8 @@ Elucidate what each parameter means and does clearly, and how they should be set
 5. Work on the DistributedSampler to make it easier to understand and shard. The current way is really unsustainable.
 6. There should be two sets of timeouts
 7. Increase the efficiency of broadcast_one in LocalSGD_Two_level. It should be continuously streamed as `avg_param` arrives. To do so, need to do `self.braodcast_one(p.data.clone(), root_rank=self._root_rank)`. Did not implement because it makes the code unclean and unclear. Without a simple `if self._rank == root_rank` type logic.
+8. Currently allreduce and broadcast are synchronous in the outer step, same with save and load parameters. These can all be asynchronous. Need to think about the gain from this. If we make them synchronous, currently actually we cannot do more work lol. Potentially change it to asynchronous. However, we could implement the algorithm in DiLoCo streaming to make this worthwhile.
+9. Make healing more asynchronous (this needs us to specify a recovery stream)
 - Potentially, we need to implement a sync function that doesn't directly call `_average`, but does the following:
 
 ```python

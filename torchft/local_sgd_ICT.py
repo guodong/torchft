@@ -30,7 +30,8 @@ class DiLoCo_ICT:
 
     def __init__(
         self,
-        outer_manager: Manager,
+        outer_manager: Optional[Manager],
+        inner_manager: Manager,
         model: nn.Module,
         inner_optimizer: optim.Optimizer,
         outer_optimizer: optim.Optimizer,
@@ -39,13 +40,16 @@ class DiLoCo_ICT:
         pin_memory: bool = True,
         debug: bool = False,
     ) -> None:
-        if outer_manager._use_async_quorum:
+        if outer_manager is not None and outer_manager._use_async_quorum:
             raise ValueError(
                 "Using DiLoCo require synchronous quorum to be enabled. "
                 "Ensure that the outer_manager is initialized with use_async_quorum=False"
             )
+        self._leader = outer_manager is not None and outer_manager._rank == 0
+
         super().__init__()
         self._outer_manager = outer_manager
+        self._inner_manager = inner_manager
         self._model = model
         self._local_optimizer = inner_optimizer
         self._local_step = 0
@@ -70,6 +74,7 @@ class DiLoCo_ICT:
         # Need to copy the parameters to the host to be safe if we are on the first step.
         self._debug = debug
         self.debug_print(f"DiLoCo_ICT initialized with {self._outer_manager=}")
+        self.debug_print(f"{self._inner_manager=}")
         self.debug_print(f"{self._model=}")
         self.debug_print(f"{self._local_optimizer=}")
         self.debug_print(f"{self._outer_optimizer=}")
@@ -81,9 +86,32 @@ class DiLoCo_ICT:
 
         self._save_parameters()
 
+        self.debug_print(f"{self._leader=}")
+
+        if not self._leader:
+            self.debug_print(f"Setting up follower")
+            self._start_ckpt_assist_listener()
+
+    def _start_ckpt_assist_listener(self) -> None:
+        # TODO: Implement the following algorithm:
+        # Start a listening thread that waits for a message on a listening socket. Potentially a message on the TCP Store
+        # When the message is received, send checkpoint to the correct location
+        # See the live checkpoint recovery logic in manager.py (in _async_quorum)
+        # This could be potentially parallelized through this process
+        # Need to add a send_checkpoint_assist_msg function to the manager._async_quorum function
+        # Anyhow, each listener has to receive one message from the leader. Or else it will not return.
+        return
+
+    def _finish_checkpoint_assist(self) -> None:
+        # TODO: Wait until the listener receives a negative message (no need to send anything), or if the listener receives a positive message, then send the checkpoint to the correct location
+        return
+
     def debug_print(self, *args, **kwargs) -> None:
         if self._debug:
-            print("[FROM LOCAL_SGD_ICT]", *args, **kwargs)
+            if self._leader:
+                print("[FROM LOCAL_SGD_ICT, LEADER]", *args, **kwargs)
+            else:
+                print("[FROM LOCAL_SGD_ICT, FOLLOWER]", *args, **kwargs)
 
     def _save_parameters(self) -> None:
         self.debug_print(f"Saving parameters")
@@ -133,59 +161,115 @@ class DiLoCo_ICT:
         self._local_step += 1
         self.debug_print(f"self._local_step: {self._local_step}")
         self.debug_print(f"self._sync_every: {self._sync_every}")
-        if self._local_step >= self._sync_every:
+        need_global_sync = self._local_step >= self._sync_every
+        if need_global_sync:
             self.debug_print(f"Syncing")
             self.sync()
+        else:
+            self.debug_print(f"Not syncing")
 
     def sync(self) -> None:
         """
         Synchronizes and averages the model weights across the outer_manager.
         """
-        self.debug_print(f"Starting quorum")
-        self._outer_manager.start_quorum()
-        self.debug_print(f"Performing sync")
-        self._perform_sync()
+        if self._leader and self._outer_manager is not None: # To suppress linting error
+            self.debug_print(f"Starting quorum")
+            self._outer_manager.start_quorum()
+
+        self.debug_print(f"Performing Outer Sync")
+        self._perform_outer_sync() # Different sync for leader and follower
         self._local_step = 0
         self.debug_print(f"Local step reset to 0")
 
-    def _perform_sync(self) -> None:
+    def _perform_outer_sync(self) -> None:
         """
         Overrides the sync method to calculate the pseugradient, average them across the outer_manager group, and
         step using the outer optimizer.
         """
         self.debug_print(f"Setting pseudogradients")
-        # Set the .grad field of each parameter to its pseudogradient
-        for name, p in self._model.named_parameters():
-            pseudogradient = p.data - self.original_parameters[name]
-            p.grad = pseudogradient
+        if self._leader:
+            # Set the .grad field of each parameter to its pseudogradient
+            # CALC_PSEUDOGRADS
+            self.debug_print("CALC_PSEUDOGRADS")
+            for name, p in self._model.named_parameters():
+                pseudogradient = p.data - self.original_parameters[name]
+                p.grad = pseudogradient
+            self.debug_print(f"calc_done")
 
-        self.debug_print(f"Averaging gradients")
-        self._average_grads()
-        self.debug_print(f"Restoring parameters")
+            self.debug_print(f"ALLREDUCE_PSEUDOGRADS")
+            self._average_grads() # synchronous allreduce
+            self.debug_print(f"Restoring parameters")
+
         # Restore the parameters back to the previous state
-        self._restore_parameters()
-        if self._outer_manager.should_commit():
+        self.debug_print(f"RESTORE_PARAMETERS")
+        self._restore_parameters() # Potentially asynchronous
+        
+        self.debug_print(f"BROADCAST_PSEUDOGRADS")
+        self.broadcast_pseudograds() # synchronous broadcast (at least currently so) 
+
+        self.debug_print(f"STEP_OUTER_OPTIMIZER")
+        if self._leader:
+            # if self._outer_manager is not None and self._outer_manager.should_commit(): TODO: This needs to be considered in order for FSDP to work. But currrently since we only have one rank per replica group, it is not needed. This shouldn't be outer_manager. It should instead by inner_manager (need to think much harder about this).
             self.debug_print(f"Stepping outer optimizer")
             # Use the outer optimizer to update the model parameters
             self._outer_optimizer.step()
             self.debug_print(f"Saving parameters")
-            self._save_parameters()
+        else:
+            # 1. Wait for the checkpoint assist to be finished
+            # 2. Step the outer optimiaer
+            # 3. Save the parameters
+            self.debug_print(f"Waiting for checkpoint assist")
+            self._finish_checkpoint_assist()
+            self.debug_print(f"Stepping outer optimizer")
+            self._outer_optimizer.step()
+            self.debug_print(f"Saving parameters")
+        
         self.debug_print(f"Zeroing gradients")
+        self._save_parameters() # Currently synchronous
         self._outer_optimizer.zero_grad()
+
+    def _follower_outer_sync(self) -> None:
+        self.debug_print(f"Performing sync")
+        self._perform_follower_sync()
+        self._local_step = 0
+        self.debug_print(f"Local step reset to 0")
+
+
+    def _perform_follower_sync(self) -> None:
+        self.debug_print(f"Performing sync")
+        self.broadcast_pseudograds()
+
 
     def _average_grads(self) -> None:
         """
         Average the gradients across the diloco group.
         """
         works = []
-        self.debug_print(f"Averaging gradients")
         for name, p in self._model.named_parameters():
             # Perform allreduce on the pseudogradients
             assert p.grad is not None
-            self.debug_print(f"Allreducing gradient for {name}")
             work = self._outer_manager.allreduce(p.grad)
             works.append(work)
         # Wait for all allreduce operations to complete
         self.debug_print(f"Waiting for allreduce operations to complete")
         for work in works:
             work.wait()
+
+    def broadcast_pseudograds(self) -> None:
+        """
+        Broadcast the pseudograds instead of the updated 
+        model parameters because pseudograds can be more 
+        aggressively quantized than the model parameters.
+        """
+        works = []
+        for name, p in self._model.named_parameters():
+            # Perform allreduce on the pseudogradients
+            assert p.grad is not None
+            work = self._inner_manager.broadcast_one(p.grad, root_rank=0)
+            works.append(work)
+
+        # Wait for all allreduce operations to complete
+        self.debug_print(f"Waiting for allreduce operations to complete")
+        for work in works:
+            work.wait()
+
