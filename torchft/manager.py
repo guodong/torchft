@@ -35,6 +35,7 @@ from contextlib import nullcontext
 from datetime import timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, TypeVar, cast
+from xml.etree.ElementPath import ops
 
 import torch
 from torch.distributed import ReduceOp, TCPStore
@@ -230,7 +231,7 @@ class Manager:
                 hostname=hostname,
                 bind=bind,
                 store_addr=f"{store_addr}:{store_port}",
-                world_size=world_size,
+                world_size=self._world_size,
                 heartbeat_interval=heartbeat_interval,
                 connect_timeout=connect_timeout,
             )
@@ -357,7 +358,7 @@ class Manager:
         tensor:
             Tensor to broadcast (in‑place).
         root_rank:
-            Rank that owns the authoritative copy (default: 0).
+            Rank that owns the authoritative copy (default: 0).
         async_op:
             Whether to perform the broadcast asynchronously (default: True).
  
@@ -366,12 +367,16 @@ class Manager:
         torch.futures.Future
             Future that resolves to *tensor* once the broadcast completes.
         """
-        work = torch.distributed.broadcast(tensor, 
-                                                src=root_rank, 
-                                                group=self._pg) # TODO: Change this to the pg. syntax
+        opts = BroadcastOptions()
+        opts.rootRank = root_rank
+        opts.asyncOp = True
+        work = self._pg.broadcast([tensor], opts)
         fut = work.get_future()
-        return fut
         
+        # Wrap the future to handle errors properly
+        fut = self.wrap_future(fut, tensor, timeout)
+        return fut
+
     def report_error(self, e: Exception) -> None:
         """
         Report an error to the manager.

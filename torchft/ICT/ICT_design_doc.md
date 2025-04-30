@@ -1,13 +1,32 @@
 # ICT Design Doct
 
-ICT is the protocol for Inter-Cluster Machine Learning Transport. Its core concepts are the following:
+ICT is the protocol for Inter-Cluster Machine Learning Transport. Its aim is to address the following difficulty in multi-cluster training:
+
+Long delays, low bandwidth, heterogenous sizes, fault tolerance
+
+Its core concepts are the following:
 
 1. A hierarchy of transport layers. There is a logical separation in each transport layer that enables each transport layer to use different optimizers, synchronization policies, and hyperparameters
-2. A controller that reconfigures the routing within each transport layer to a) Enable fault tolerant routing, and b) minimize communication overhead
+2. Autoconfiguration of training hyperparameters
+    - A controller that reconfigures the routing within each transport layer to a) Enable fault tolerant routing, and b) minimize communication overhead
+        - All the more important in multi-cluster settings with heterogenous networks, long-delays and low-bandwidth
+    - Autoconfiguration of dataset partitioning and training hyperparameters
+    - 
+
+There are also advanced optimziations that one can configure for ICT:
+3. Maximum asynchronous execution
+    - All communication is done asynchronously to overlap with computation.
+    - Uses new research from multi-cluster training dynamics to take advantage of computation time even when gradients are being synced cross-cluster
+        - E.g. Streaming DiLoCo
+
+
 
 A simple example of the use case is LocalSGD. In LocalSGD, every step we will call `manager_local.allreduce(params)` to synchronize the gradients within the local group. Then, after every `sync_every` steps, we will call `manager_global.all_reduce(params)` to synchronize the global gradients.
 
 Below is a diagram of a scenario that ICT operates in:
+- Centralized controller
+- Don't introduce 3rd party dependency unless necessary
+
 
 ```txt
                         ┌────────────┐
@@ -32,7 +51,7 @@ Below is a diagram of a scenario that ICT operates in:
         │      │           │      │           │      │
         │      │           │      │           │      │
    ┌────┴┐  ┌──┴──┐   ┌────┴┐  ┌──┴──┐   ┌────┴┐  ┌──┴──┐
-   │ DB1 │  │ DB2 │   │ DB1 │  │ DB2 │   │ DB1 │  │ DB2 │
+   │ RG1 │  │ RG2 │   │ RG1 │  │ RG2 │   │ RG1 │  │ RG2 │
    └─────┘  └─────┘   └─────┘  └─────┘   └─────┘  └─────┘
 ```
 
@@ -80,32 +99,9 @@ Sub cases
 For example, change the H param of diloco
 
 
+## To Run the current code:
 
-## State of the code
-
-Currently, we have bash scripts
-```bash
-/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_lighthouse_localsgd.sh
-/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh
-```
-
-To run them, we do the following:
-
-### This script is set up for running localsgd on shenzhen-node2 and shenzhen-nodem
-
-I set up my environment according to the TorchTitan README and TorchFT README.
-
-For a simple first run, first start the lighthouse on shenzhen-nodem (node 2 is not confirmed to work): 
-```bash
-/srv/apps/warren/torchft/.shell_scripts/run_lighthouse.sh
-
-Then,
-```bash
-On node-m:source /srv/apps/warren/torchft/.shell_scripts/run_lighthouse.sh
-On node-2:source /root/warren/torchft/.shell_scripts/run_server.sh
-```
-
-#### How the environment was set up
+First, set up the environment.
 
 ```bash
 # TorchTitan setup
@@ -125,44 +121,179 @@ export PATH=$HOME/.local/bin:$PATH
 pip install .
 ```
 
-#### Two-level localsgd
-
-We set up the fault tolerant localSGD code using two layers of managers through `/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_lighthouse_localsgd.sh` and `/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh`. The logic is `/srv/apps/warren/torchft/train_localsgd-two_level.py`.
-
-You start this through the following:
-
-Starting lighthouses:
-
+Then, run the following commands. This script is set up for running localsgd on shenzhen-node2 and shenzhen-nodem
 ```bash
-/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_lighthouse_localsgd.sh global 0 # Global Lighthouse: [lighthouse] 2025-04-19 09:29:20  10.0.0.3:29520
-/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_lighthouse_localsgd.sh local 0 # For Cluster 0: [lighthouse] 2025-04-19 09:29:55  10.0.0.3:29521
-/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_lighthouse_localsgd.sh local 1 # For Cluster 1: [lighthouse] 2025-04-19 09:30:09  10.0.0.3:29522
+# Example:
+# ./run_server_localsgd.sh <cuda_devices> <replica_group_id> <cluster_group_id> [train_script] [script‑args…]
+
+# For the experimental DiLoCo-ICT, we need to run the following command:
+
+## On Cluster 0:
+/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 0 0 /srv/apps/warren/torchft/train_DiLoCo-ICT.py 1 2 1000 # Replica Group 0, Cluster 0, wait for 1 second between steps, sync every 2 steps for 1000 steps
+/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 1 1 0 /srv/apps/warren/torchft/train_DiLoCo-ICT.py 1 2 1000 # Replica Group 1, Cluster 0, wait for 1 second between steps, sync every 2 steps for 1000 steps
+
+## On Cluster 1:
+/root/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 0 1 /root/warren/torchft/train_DiLoCo-ICT.py 1 2 1000 # Replica Group 0, Cluster 1, wait for 1 second between steps, sync every 2 steps for 1000 steps
+/root/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 1 1 /root/warren/torchft/train_DiLoCo-ICT.py 1 2 1000 # Replica Group 1, Cluster 1, wait for 1 second between steps, sync every 2 steps for 1000 steps
+
+
+# Demo 2: Two clusters on a single cluster 2 GPU setup:
+
+# Note that all three lighthouses have to be running for this to work.
+
+# Cluster 0:
+/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 0 0 /srv/apps/warren/torchft/train_DiLoCo-ICT.py 1 2 1000 # Replica Group 0, Cluster 0, wait for 1 second between steps, sync every 2 steps for 1000 steps, running of CUDA_VISIBLE_DEVICES=0
+
+/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 1 0 1 /srv/apps/warren/torchft/train_DiLoCo-ICT.py 1 2 1000 # Replica Group 0, Cluster 1, wait for 1 second between steps, sync every 2 steps for 1000 steps, running of CUDA_VISIBLE_DEVICES=1
 ```
 
-Running the different processes:
+## Features
 
-#### ./run_server_localsgd.sh <cuda_devices> <replica_group_id> <cluster_group_id> [train_script] [script‑args…]
+### Routing Information
 
-```bash
-/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 0 0 /srv/apps/warren/torchft/train_localsgd-two_level.py 1 2 1000 # Replica Group 0, Cluster 0, wait for 1 second between steps, sync every 2 steps for 1000 steps
-/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 1 1 0 /srv/apps/warren/torchft/train_localsgd-two_level.py 1 2 1000 # Replica Group 1, Cluster 0, wait for 1 second between steps, sync every 2 steps for 1000 steps
-/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 0 0 1 /srv/apps/warren/torchft/train_localsgd-two_level.py 1 2 1000 # Replica Group 0, Cluster 1, wait for 1 second between steps, sync every 2 steps for 1000 steps
-/srv/apps/warren/torchft/.shell_scripts/local_sgd/run_server_localsgd.sh 1 1 1 /srv/apps/warren/torchft/train_localsgd-two_level.py 1 2 1000 # Replica Group 1, Cluster 1, wait for 1 second between steps, sync every 2 steps for 1000 steps
+We want to provide flexible routing.
+
+Ultimately, this should be done at the NCCL level. We should have a NCCL-P Library that enables the routing to be configured.
+
+### Hyperparameter Autoconfig
+
+This is a main feature of ICT. There are three following features that we support. 
+
+One design principle of ICT is extensibility. Therefore, we make it as easy as possible for others to build custom modules on top of our lighthouse module.
+
+1. Dataloader configuration
+    - local_batch_size: int
+    - global_batch_size: int
+2. Hyperparameter Configuration
+    - Optimizer hyperparameters
+        - momentum: float
+        - lr: float
+        - weight_decay: float
+        - betas: float
+        - nesterov: bool
+3. Failure configuration
+    - Timeout
+
+#### Dataloader information
+
+Abstractly, think about the data as a list of tensors. I want to have a DistributedSampler component that the lighthouse queries.
+
+Now, think about it as the following:
+
+
+
+There is a 
+Ideally, the global_batch_size=np.dot(local_batch_sizes, sync_everies), local_batch_sizes dot_product iters * the local_batch_size, 
+
+ The sampler does the following:
+
+This needs to be coupled with a data movement service (e.g. Effingle) to move the data to the correct places for the sampling service.
+
+The current torchft distributed sampler does the followingL
+
+```python
+class DistributedSampler(data.distributed.DistributedSampler):
+    """
+    DistributedSampler extends the standard PyTorch DistributedSampler with a
+    `num_replica_groups` that is used to shard the data across the fault
+    tolerance replica groups.
+
+    torchft doesn't know how many replica groups ahead of time so we need to set
+    this to be the max number.
+
+    This sampler is inherently lossy when used with torchft. torchft
+    occasionally drops batches on rejoining and if a replica group is down that
+    group examples will never be used. This can lead to imbalances if using a
+    small dataset.
+
+    This will shard the input dataset into ``num_replicas*num_replica_group``
+    number of shards.
+
+    Each shard rank is calculated via: ``rank + num_replicas*replica_group``
+
+    num_replicas and replica_group must be the same on all workers.
+    """
+
+    def __init__(
+        self,
+        dataset: data.Dataset,
+        replica_group: int,
+        num_replica_groups: int,
+        rank: Optional[int] = None,
+        num_replicas: Optional[int] = None,
+        **kwargs: object,
+    ) -> None:
+        """
+        Args:
+            data: the dataset to use
+            replica_group: the group ID (0-num_replica_groups) to use for this shard of data.
+            num_replica_groups: the max number of global replica groups
+            rank: the local group rank
+            num_replicas: the local group world size
+        """
+        if rank is None:
+            rank = dist.get_rank()
+        if num_replicas is None:
+            num_replicas = dist.get_world_size()
+
+        self.global_rank: int = rank + num_replicas * replica_group
+        self.global_world_size: int = num_replicas * num_replica_groups
+
+        super().__init__(
+            dataset,
+            rank=self.global_rank,
+            num_replicas=self.global_world_size,
+            # pyre-fixme[6]: got object
+            **kwargs,
+        )
 ```
 
-## Description of the code
+Pytorch Datasets:
 
-Currently, the code is in the following state:
+```python
+class Dataset(Generic[T_co]):
+    r"""An abstract class representing a :class:`Dataset`.
 
-I the run_lighthouse_localsgd and run_server_localsgd sets up the port connections successfully so that we are able to start the TCPStores correctly, and have both the intra and inter-replica groups to connect to their corresponding lighthouses.
+    All datasets that represent a map from keys to data samples should subclass
+    it. All subclasses should overwrite :meth:`__getitem__`, supporting fetching a
+    data sample for a given key. Subclasses could also optionally overwrite
+    :meth:`__len__`, which is expected to return the size of the dataset by many
+    :class:`~torch.utils.data.Sampler` implementations and the default options
+    of :class:`~torch.utils.data.DataLoader`. Subclasses could also
+    optionally implement :meth:`__getitems__`, for speedup batched samples
+    loading. This method accepts list of indices of samples of batch and returns
+    list of samples.
 
-However, we were encountering a lot of bugs in `train_localsgd-two_level.py`. So we are rewriting that code after spending a day of doing major redesign. (see the graph-viz diagram written below for our current design).
+    .. note::
+      :class:`~torch.utils.data.DataLoader` by default constructs an index
+      sampler that yields integral indices.  To make it work with a map-style
+      dataset with non-integral indices/keys, a custom sampler must be provided.
+    """
 
-We will entirely rely on DiLoCo. and a custom context manager. Our context manager will be
+    def __getitem__(self, index) -> T_co:
+        raise NotImplementedError("Subclasses of Dataset should implement __getitem__.")
 
-## FSM
+    # def __getitems__(self, indices: List) -> List[T_co]:
+    # Not implemented to prevent false-positives in fetcher check in
+    # torch.utils.data._utils.fetch._MapDatasetFetcher
 
-Code for FSM Generation
+    def __add__(self, other: "Dataset[T_co]") -> "ConcatDataset[T_co]":
+        return ConcatDataset([self, other])
+
+    # No `def __len__(self)` default?
+    # See NOTE [ Lack of Default `__len__` in Python Abstract Base Classes ]
+    # in pytorch/torch/utils/data/sampler.py
+
+```
+
+```python
+dataset = Tensor_List(Length=num_data)
+```
+
+## Diagram
+
+The two-level DiLoCo implementation follows the diagram below closely. There is a inner process group within each cluster, and a cross-cluster process group. Only one replica group in each cluster participates in the cross-cluster process group. That replica group is called the "Leader". Information from the cross-cluster process group is broadcasted to the other replica groups ("followers") from the Leader.
+
 ```python
 from graphviz import Digraph
 from IPython.display import Image, display

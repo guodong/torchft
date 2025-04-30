@@ -260,6 +260,7 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100, 
         outer_optimizer=outer_optimizer,
         sync_every=sync_every,
         backup_device=device, #TODO: Make this CPU for CPU offloading. Currently using GPU for backup device.
+        device=device,
         debug=True,
     ) as diloco:
         # If REPLICA_GROUP_ID == 0, then sync with the outer manager.
@@ -273,9 +274,9 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100, 
             y = y.to(device)
             output = m(x)
             loss = criterion(output, y)
-            managed_inner_optimizer.zero_grad() #TODO: Make this managed_inner_optimizer.zero_grad()
+            managed_inner_optimizer.zero_grad()
             loss.backward()
-            managed_inner_optimizer.step() #TODO: Make this managed_inner_optimizer.step()
+            managed_inner_optimizer.step()
 
             if current_step >= steps_to_run:
                 # complete training

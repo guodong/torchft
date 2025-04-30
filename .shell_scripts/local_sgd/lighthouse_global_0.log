@@ -1,0 +1,3 @@
+[lighthouse] 2025-04-23 03:53:46  10.0.0.3:29520
+2025-04-23T03:53:47.553 [INFO] [torchft::lighthouse] - Lighthouse listening on: http://sz-k8s-master:29520
+2025-04-23T03:53:47.554 [INFO] [torchft::lighthouse] - Quorum status: New quorum not ready, only have 0 participants, need min_replicas 1 [0/0 participants healthy][0 heartbeating][shrink_only=false]

@@ -100,12 +100,14 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100) 
         else ProcessGroupGloo(timeout=timedelta(seconds=5))
     )
 
+    lighthouse_addr_global = os.environ.get("TORCHFT_LIGHTHOUSE_GLOBAL")
     manager = Manager(
         pg=pg,
         min_replica_size=1,
         load_state_dict=load_state_dict,
         state_dict=state_dict,
         replica_id=f"train_localsgd_{REPLICA_GROUP_ID}",
+        lighthouse_addr=lighthouse_addr_global,
         timeout=timedelta(seconds=10),
     )
 
@@ -129,9 +131,7 @@ def main(sleep_time: float = 1.0, sync_every: int = 2, steps_to_run: int = 100) 
             return x
 
     m = Net().to(device)
-    # m = DistributedDataParallel(manager, m)
     optimizer = optim.Adam(m.parameters())
-    # optimizer = Optimizer(manager, optimizer)
     criterion = nn.CrossEntropyLoss()
 
     with LocalSGD(manager, m, optimizer, sync_every=sync_every):

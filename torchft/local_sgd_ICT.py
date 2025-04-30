@@ -17,6 +17,7 @@ from torch.optim.optimizer import Optimizer
 from torch.utils.hooks import RemovableHandle
 
 from torchft.manager import Manager
+from torchft.optim import OptimizerWrapper
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ class DiLoCo_ICT:
         outer_optimizer: optim.Optimizer,
         sync_every: int,
         backup_device: Optional[torch.device] = None,
+        device: Optional[torch.device] = None,
         pin_memory: bool = True,
         debug: bool = False,
     ) -> None:
@@ -56,6 +58,7 @@ class DiLoCo_ICT:
         self._sync_every = sync_every
         assert sync_every >= 1, "sync_every must be greater than or equal to 1"
         self._backup_device = backup_device
+        self._device = device
         self._pin_memory = pin_memory
 
         self._hooks: List[RemovableHandle] = []
@@ -209,36 +212,49 @@ class DiLoCo_ICT:
 
         self.debug_print(f"STEP_OUTER_OPTIMIZER")
         if self._leader:
-            # if self._outer_manager is not None and self._outer_manager.should_commit(): TODO: This needs to be considered in order for FSDP to work. But currrently since we only have one rank per replica group, it is not needed. This shouldn't be outer_manager. It should instead by inner_manager (need to think much harder about this).
-            self.debug_print(f"Stepping outer optimizer")
+            # Leader decides whether to commit and broadcasts the decision (1 = commit, 0 = skip)
+            should_commit_flag = self._outer_manager.should_commit() # Implicitly waits for the live checkpoint recovery to be finished
+            commit_tensor = torch.tensor([1 if should_commit_flag else 0], dtype=torch.uint8, device=self._device)
+            # Broadcast to everyone in the *inner* replica‑group. Leader is root_rank 0.
+            fut = self._inner_manager.broadcast_one(commit_tensor, root_rank=0)
+            fut.wait()
+            self.debug_print(f"Broadcasted should_commit={should_commit_flag}")
+            
             # Use the outer optimizer to update the model parameters
-            self._outer_optimizer.step()
-            self.debug_print(f"Saving parameters")
+            # Need to check whether should_commit()
+            # Currently this will always return true
+            if should_commit_flag:
+                # Use the outer optimizer to update the model parameters
+                self._outer_optimizer.step()
+                self.debug_print(f"Commited, saving parameters")
+                self._save_parameters() # Currently synchronous
+            else:
+                self.debug_print(f"Not committing")
+            self._outer_optimizer.zero_grad()
         else:
+            # Is follower
             # 1. Wait for the checkpoint assist to be finished
             # 2. Step the outer optimiaer
             # 3. Save the parameters
+            # Followers receive leader’s decision
+            # Wait until the checkpoint‑assist thread (if any) finishes before potentially stepping.
             self.debug_print(f"Waiting for checkpoint assist")
             self._finish_checkpoint_assist()
+
+            # Receive leader’s decision
+            commit_tensor = torch.zeros(1, dtype=torch.uint8, device=self._device)
+            self._inner_manager.broadcast_one(commit_tensor, root_rank=0).wait()
+            should_commit_flag = bool(commit_tensor.item())
+            self.debug_print(f"Received should_commit={should_commit_flag} from leader")
+
             self.debug_print(f"Stepping outer optimizer")
-            self._outer_optimizer.step()
-            self.debug_print(f"Saving parameters")
-        
+            if should_commit_flag:
+                self._outer_optimizer.step()
+            self.debug_print(f"Save parameters")
+            self._save_parameters() # Currently synchronous
+
         self.debug_print(f"Zeroing gradients")
-        self._save_parameters() # Currently synchronous
         self._outer_optimizer.zero_grad()
-
-    def _follower_outer_sync(self) -> None:
-        self.debug_print(f"Performing sync")
-        self._perform_follower_sync()
-        self._local_step = 0
-        self.debug_print(f"Local step reset to 0")
-
-
-    def _perform_follower_sync(self) -> None:
-        self.debug_print(f"Performing sync")
-        self.broadcast_pseudograds()
-
 
     def _average_grads(self) -> None:
         """
@@ -252,8 +268,11 @@ class DiLoCo_ICT:
             works.append(work)
         # Wait for all allreduce operations to complete
         self.debug_print(f"Waiting for allreduce operations to complete")
+        counter = 0
         for work in works:
             work.wait()
+            counter += 1
+            self.debug_print(f"Allreduce operation {counter} completed")
 
     def broadcast_pseudograds(self) -> None:
         """
@@ -270,6 +289,9 @@ class DiLoCo_ICT:
 
         # Wait for all allreduce operations to complete
         self.debug_print(f"Waiting for allreduce operations to complete")
+        counter = 0
         for work in works:
             work.wait()
+            counter += 1
+            self.debug_print(f"Allreduce operation {counter} completed")
 
